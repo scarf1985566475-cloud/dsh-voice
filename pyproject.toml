@@ -1,0 +1,25 @@
+[project]
+name = "dsh-voice"
+version = "0.1.0"
+description = "Local speech transcription and English-to-Chinese simultaneous interpretation for DeepSeek Harness"
+requires-python = ">=3.10"
+dependencies = [
+    "mlx-whisper>=0.4.3",
+    "numpy>=1.26",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "fastmcp>=2.0",
+    "httpx>=0.27",
+    "imageio-ffmpeg>=0.5",
+]
+
+[project.scripts]
+dsh-voice = "dsh_voice.cli:main"
+dsh-voice-mcp = "dsh_voice.mcp_server:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["dsh_voice*"]

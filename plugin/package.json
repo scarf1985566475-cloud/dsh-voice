@@ -1,0 +1,20 @@
+{
+  "name": "dsh-voice-interpreter",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Live English-to-Chinese simultaneous interpretation panel for the DSH web client: streams microphone audio to the local dsh-voice service and renders live captions with Chinese translations.",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "license": "MIT",
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "immediately": true
+    }
+  }
+}
