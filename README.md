@@ -369,6 +369,9 @@ dsh-voice selftest [--live]                    # 端到端自检（无需麦克�
 
 ## 测试
 
+浏览器那三组测试需要 `DSH_HOME` 指向你的 DSH 目录（它们从 DSH 的 profile 里解析 React，
+这样模块实例和运行中的应用是同一个）。没设的话会打印它试过的路径，照着设一个就行。
+
 ```bash
 bash tests/run_all.sh          # 离线检查（无模型、无网络，秒级，9 组）
 bash tests/run_all.sh --full   # 全链路（模型 + DeepSeek API，约 3 分钟）

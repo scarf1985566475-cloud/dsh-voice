@@ -24,22 +24,31 @@ const BUNDLE = join(PROJECT, 'plugin', 'client.js')
 
 /**
  * Resolve the same React instance the web shell seeds into its module table.
- * Anchored at the DSH profile so module identity matches the running app; the
- * profile path follows DSH_HOME, so the harness is not tied to one machine.
+ * Anchored at a DSH profile so module identity matches the running app, but the
+ * anchor is searched rather than hardcoded, so the harness follows DSH_HOME
+ * instead of one machine's layout.
  */
 function profileRequireFor() {
-  const home = process.env.DSH_HOME || join(homedir(), '.dsh-home')
-  const anchor = process.env.DSH_PROFILE_PACKAGE || join(home, 'profiles', 'web', 'package.json')
-  const require = createRequire(anchor)
-  try {
-    require.resolve('react')
-  } catch {
-    throw new Error(
-      `cannot resolve react from ${anchor}. Set DSH_HOME to your DSH home directory ` +
-      '(the one holding profiles/), or DSH_PROFILE_PACKAGE to a package.json inside the profile.',
-    )
+  const candidates = [
+    process.env.DSH_PROFILE_PACKAGE,
+    process.env.DSH_HOME && join(process.env.DSH_HOME, 'profiles', 'web', 'package.json'),
+    join(homedir(), '.dsh-home', 'profiles', 'web', 'package.json'),
+    join(PROJECT, 'node_modules', 'package.json'),
+  ].filter(Boolean)
+  for (const anchor of candidates) {
+    const require = createRequire(anchor)
+    try {
+      require.resolve('react')
+    } catch {
+      continue
+    }
+    return require
   }
-  return require
+  throw new Error(
+    'cannot resolve react for the browser-side tests. Set DSH_HOME to your DSH home directory '
+    + '(the one holding profiles/), or DSH_PROFILE_PACKAGE to a package.json inside a profile. '
+    + `Tried:\n  ${candidates.join('\n  ')}`,
+  )
 }
 
 const profileRequire = profileRequireFor()
