@@ -789,6 +789,13 @@ class LiveSession:
 
     # ── client control ───────────────────────────────────────────────────────
 
+    def runtime_settings(self) -> dict[str, object]:
+        """Public settings reflecting runtime toggles, for client acknowledgements."""
+        payload = dict(self.settings.as_public_dict())
+        payload["captions"] = self._captions
+        payload["translate_partials"] = self._translate_partials
+        return payload
+
     def configure(
         self,
         *,
@@ -821,6 +828,12 @@ class LiveSession:
         one a user is most likely to be reading.
         """
         self._segmenter.flush()
+        if not self._captions:
+            # Captions are off: there is nothing to decode, and enqueueing a
+            # flush would resurrect a hallucinated sentence at stop time.
+            self._committed = max(self._committed, self._consumed)
+            self._drop_previews()
+            return
         if self._closed or self._consumed <= self._committed:
             return
         done: asyncio.Future[None] = asyncio.get_running_loop().create_future()

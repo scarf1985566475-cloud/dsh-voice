@@ -406,7 +406,7 @@ async def _handle_control(
             translate_partials=message.get("translate_partials"),
             captions=message.get("captions"),
         )
-        await send({"type": "configured", "settings": session.settings.as_public_dict()})
+        await send({"type": "configured", "settings": session.runtime_settings()})
     elif kind == "title":
         title = str(message.get("title") or "")
         if session.recorder is None:
