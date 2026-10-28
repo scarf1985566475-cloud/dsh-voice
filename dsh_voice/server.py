@@ -26,6 +26,7 @@ from typing import Any
 
 import numpy as np
 from fastapi import FastAPI, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
@@ -110,6 +111,18 @@ def create_app() -> FastAPI:
         yield
 
     app = FastAPI(title="dsh-voice", version=__version__, lifespan=lifespan)
+
+    # The interpreter panel lives on the DSH GUI origin (usually
+    # http://127.0.0.1:<port>) while this service answers on 127.0.0.1:8768, so
+    # every panel fetch of the meeting API is cross-origin. Without CORS the
+    # browser sends an OPTIONS preflight and the list never loads (405).
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["null"],
+        allow_origin_regex=r"^(https?://(127\.0\.0\.1|localhost)(:\d+)?|app://.*|dsh://.*|file://.*)$",
+        allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+        allow_headers=["*"],
+    )
 
     @app.get("/health")
     async def health() -> JSONResponse:

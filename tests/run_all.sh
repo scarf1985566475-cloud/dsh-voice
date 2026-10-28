@@ -38,15 +38,19 @@ echo "== 5/10 command line (every subcommand, offline) =="
 "$PY" tests/cli_test.py || fail "command line"
 
 echo
-echo "== 6/10 browser bundle (render, slot registration, minutes renderer) =="
+echo "== 6/11 HTTP surface (CORS for the panel, meeting list) =="
+"$PY" tests/server_http_test.py || fail "HTTP surface"
+
+echo
+echo "== 7/11 browser bundle (render, slot registration, minutes renderer) =="
 node tests/plugin_render_test.mjs || fail "browser bundle"
 
 echo
-echo "== 7/10 host half (supervisor behaviour) =="
+echo "== 8/11 host half (supervisor behaviour) =="
 node tests/plugin_host_test.mjs || fail "host half"
 
 echo
-echo "== 8/10 live session survives navigation (route changes must not stop a recording) =="
+echo "== 9/11 live session survives navigation (route changes must not stop a recording) =="
 node tests/plugin_session_test.mjs || fail "live session lifetime"
 
 if [[ $FULL -eq 0 ]]; then
@@ -56,12 +60,12 @@ if [[ $FULL -eq 0 ]]; then
 fi
 
 echo
-echo "== 9/10 live session + WebSocket service + meeting API =="
+echo "== 10/11 live session + WebSocket service + meeting API =="
 "$PY" tests/live_stream_test.py || fail "live session"
 "$PY" tests/server_ws_test.py || fail "websocket service"
 
 echo
-echo "== 10/10 recording -> transcript -> minutes =="
+echo "== 11/11 recording -> transcript -> minutes =="
 "$PY" tests/recording_pipeline_test.py || fail "recording pipeline"
 
 echo

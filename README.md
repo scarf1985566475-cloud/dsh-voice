@@ -378,7 +378,7 @@ Vault 解析顺序：`--vault` → `DSH_VOICE_OBSIDIAN_VAULT` → Obsidian 注�
 | `PARTIAL_INTERVAL` | `2.0` | 预览解码间隔（秒） |
 | `END_SILENCE_MS` | `700` | 多长静音判为一句结束 |
 | `MAX_SEGMENT` | `20` | 单段硬上限（秒） |
-| `RECORD` | `false` | 实时会话是否写入会议记录（默认关，纪要改用整场录音离线转写） |
+| `RECORD` | `true` | 实时会话是否写入会议记录；纯字幕可加 `serve --no-record` |
 | `MEETINGS_DIR` | `meetings/` | 会议记录根目录 |
 | `API_BASE` / `API_MODEL` | `https://api.deepseek.com` / `deepseek-chat` | 翻译与纪要后端 |
 | `OBSIDIAN_VAULT` | 注册表里最后打开的 vault | Obsidian vault 目录 |
@@ -395,7 +395,7 @@ Vault 解析顺序：`--vault` → `DSH_VOICE_OBSIDIAN_VAULT` → Obsidian 注�
 ## 命令
 
 ```bash
-dsh-voice serve [--port N] [--no-translate] [--reload]   # 实时服务（面板/MCP 的后端）
+dsh-voice serve [--port N] [--no-translate] [--no-record] [--reload]   # 实时服务（面板/MCP 的后端）
 dsh-voice transcribe FILE [--translate|--text] # 文件转写
 dsh-voice translate "text"                     # 英文 → 中文
 dsh-voice record --seconds 15 --transcribe     # 麦克风录音
@@ -430,7 +430,7 @@ DSH_DESKTOP_NODE_EXECUTABLE='/Applications/DeepSeek Harness.app/Contents/MacOS/D
 ```
 
 ```bash
-bash tests/run_all.sh          # 离线检查（无模型、无网络，秒级，8 组）
+bash tests/run_all.sh          # 离线检查（无模型、无网络，秒级，11 组）
 bash tests/run_all.sh --full   # 全链路（模型 + DeepSeek API，约 3 分钟）
 
 # 也可以单独跑：
@@ -438,6 +438,7 @@ bash tests/run_all.sh --full   # 全链路（模型 + DeepSeek API，约 3 分�
 .venv-audio/bin/python tests/obsidian_export_test.py     # 笔记结构、文件名安全、重复导出
 .venv-audio/bin/python tests/asr_config_test.py          # 语言映射与模型选择（防旧模型回归）
 .venv-audio/bin/python tests/benchmark_test.py           # 基准测试自身：WER 算法、加噪、推荐规则
+.venv-audio/bin/python tests/server_http_test.py        # 面板跨域预检 + 会议列表（record 默认开）
 node tests/plugin_render_test.mjs                        # 面板渲染 + 纪要渲染器（含 XSS 安全）
 node tests/plugin_host_test.mjs                          # 守护逻辑：复用而不抢占
 node tests/plugin_session_test.mjs                       # 录音生命周期：切页面不能断（本 bug 的回归测试）

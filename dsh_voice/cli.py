@@ -117,6 +117,8 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         overrides["host"] = args.host
     if args.no_translate:
         overrides["translate"] = False
+    if args.no_record:
+        overrides["record"] = False
     if args.language:
         overrides["language"] = args.language
     server.STATE.settings = load_settings(**overrides)
@@ -545,6 +547,8 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--port", type=int)
     serve.add_argument("--language", help="source language code (default: auto-detect)")
     serve.add_argument("--no-translate", action="store_true", help="captions only, no Chinese translation")
+    serve.add_argument("--no-record", action="store_true",
+                       help="do not write live sessions into the meeting records")
     serve.add_argument("--reload", action="store_true",
                        help="restart on Python source changes (development; drops a live session)")
     serve.set_defaults(func=_cmd_serve)

@@ -368,9 +368,10 @@ def load_settings(**overrides: object) -> InterpreterSettings:
         "start_speech_ms": _env_int("START_SPEECH_MS", 140),
         "max_segment_s": _env_float("MAX_SEGMENT", 20.0),
         "min_segment_s": _env_float("MIN_SEGMENT", 0.45),
-        # 默认不把实时会话写入会议记录：纪要改由整场录音离线转写产出，
-        # 实时记录只会留下同一场会的低质量副本。需要时设 DSH_VOICE_RECORD=1。
-        "record": _env_bool("RECORD", False),
+        # 实时会话默认写入会议记录：面板停止后列表里应当能看到这一场，
+        # 会议纪要仍可由整场录音离线转写或对话中重新生成。要纯字幕不上记录，
+        # 启动服务时加 --no-record（或设 DSH_VOICE_RECORD=0）。
+        "record": _env_bool("RECORD", True),
         "meetings_dir": _env("MEETINGS_DIR", str(DEFAULT_MEETINGS_DIR)),
         "api_base": _env("API_BASE", DEEPSEEK_BASE_URL),
         "api_model": _env("API_MODEL", DEEPSEEK_MODEL),
