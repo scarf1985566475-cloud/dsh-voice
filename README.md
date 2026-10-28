@@ -10,8 +10,38 @@
 | **会议纪要** | 一键把记录整理成中文纪要：概览 / 关键要点 / 决定事项 / 待办（含负责人）/ 风险 |
 | **导出 Obsidian** | 纪要 + 全文写成 Obsidian 原生笔记（frontmatter、双链可用、待办是真正的 checkbox） |
 
-全部识别在本机完成（MLX Whisper，Apple Silicon 加速）；只有英文文本会发给 DeepSeek 做翻译和总结。
+全部识别在本机完成（Qwen3-ASR，MLX 加速）；只有英文文本会发给 DeepSeek 做翻译和总结。
 音频**从不上传**。
+
+---
+
+## 作为 DSH 插件安装
+
+插件市场：已提交 1024Store 与 awesome-dsh-plugin，并带 GitHub topic `dsh-plugin`（dshfind 等聚合站按 topic 收录）。
+从源码或插件包安装都是两步——先装 Python 后端（识别在本机跑），再装 DSH 插件包：
+
+```bash
+# 1. Python 后端：独立 venv，与 DSH 自带环境隔离
+python3 -m venv ~/.dsh-voice/venv
+~/.dsh-voice/venv/bin/pip install -e /path/to/dsh-voice
+~/.dsh-voice/venv/bin/dsh-voice download-model        # 约 0.7GB（Qwen3-ASR-0.6B-4bit）
+
+# 2. DSH 插件包（GUI 的插件市场里搜「同传」也可以；CLI 用包名或 tarball）
+dsh plugin --profile web add dsh-voice-interpreter
+```
+
+装好后让守护进程找到后端——写进 shell 启动文件（GUI 启动时生效）：
+
+```bash
+export DSH_VOICE_PROJECT=/path/to/dsh-voice          # 插件安装目录
+export DSH_VOICE_PYTHON=$HOME/.dsh-voice/venv/bin/python
+```
+
+也可以不设环境变量：编辑 profile 的 `cordis.patch.yml`，在 `voice-interpreter` 那行的 `config`
+下写 `projectDir` / `python`。刷新 DSH 页面后，会话上方出现「同传」标签；点「开始收听」时
+插件会自动拉起服务（`autoStart: false` 则只做健康检查，不托管进程）。
+
+> 插件包只带 Node 侧面板与守护逻辑；Python 后端必须装一次（`pip install`）。这是本插件唯一的手工步骤。
 
 ---
 
@@ -34,6 +64,22 @@
 - **实时** — 点「开始收听」，边听边出字幕；同时自动记录本次会议（可当场命名）。
 - **会议记录** — 左侧是历史会议列表，选中后可看全文或纪要，点「生成纪要」出中文会议纪要。
 
+### 实时面板能做什么
+
+| 区域 | 内容 |
+|---|---|
+| 顶部状态条 | 监听状态（含「未检测到声音」提示）、会话计时、麦克风电平、模型/翻译/记录三个状态丸 |
+| 设置行 | 显示模式（中 / 中+英 / 英）、字号（小/中/大）、自动跟随、预览也翻译、导出 Markdown / SRT |
+| 搜索行 | 按 `/` 打开，过滤并高亮英中双语（Esc 关闭） |
+| 字幕行 | 左侧 `mm:ss` 时间、识别语言 badge、`识别中`/`翻译中` 状态、最终/实时耗时；未定稿行用虚线左边框 + 闪烁光标标识 |
+| 底部 | 隐私说明、段数、时长、翻译失败数、查看会议记录；`↓ 回到最新` 悬浮按钮 |
+| 键盘 | 空格 开始/停止 · M 暂停收音 · / 搜索 · F 回到最新 · Esc 关闭浮层 |
+
+- 录制中切到别的标签页再切回来，字幕与会议都还在（会话状态在模块作用域，不在组件里）。
+- 超过 400 句时只保留最近 400 句，列表顶部会提示并提供会议存档入口。
+- 无障碍：字幕容器 `role="log"` + `aria-live="off"`，另有隐藏的 polite 区域只播报定稿中文——避免每个 partial 都被朗读。
+- 麦克风电平持续 3 秒为 0 时，状态会变成「未检测到声音 · 检查麦克风」，而不是显示「监听中」却没反应。
+
 ---
 
 ## 架构
@@ -47,7 +93,7 @@
                                     │ ws://127.0.0.1:8768/live  (+ /meetings)
                     ┌───────────────▼──────────────────────────────┐
                     │ dsh-voice 本地服务（Python / FastAPI）         │
-                    │  VAD 分段 → 滚动窗口 → MLX Whisper 识别        │
+                    │  VAD 分段 → 滚动窗口 → Qwen3-ASR 识别          │
                     │  → 稳定句子提交 → DeepSeek 英译中              │
                     │  → 追加写入会议日志（JSONL，崩溃安全）          │
                     │  → 纪要：结构化 JSON → 本地渲染 Markdown       │
@@ -148,56 +194,60 @@ Markdown 由本机渲染。这样面板能把待办渲染成表格，模型答�
 
 ---
 
-## 本地模型：怎么选、为什么
+## 本地模型：为什么是 Qwen3-ASR
+
+识别引擎是 **Qwen3-ASR-0.6B-4bit**（`mlx-community/Qwen3-ASR-0.6B-4bit`，Apache-2.0），
+全部在本机 MLX 上推理，模型目录 `models/qwen3-asr-0.6b-4bit/`（约 682MB）。旧的 Whisper
+`turbo` / `distil` / `small` 已移到 `models/_retired/`，不再参与任何路径。
+
+换掉 Whisper 不是因为它不够"大"，而是它在**真实远场录音**上的两种失败太伤：
+
+| Whisper 的毛病（95 分钟真实讲座录音实测） | Qwen3-ASR 的表现（同一批音频） |
+|---|---|
+| 静音/噪声窗输出 "Thank you."（全片 24 次）、"."（24 次）、"Loss."（42 次） | 静音窗最多一个 "The." 或空；30 秒纯噪声直接空 |
+| 连续重复段 353 处，"it's" 出现 48 次 | 中文 TTS CER 3.9%（turbo 7.8%、small 5.8%），无明显复读 |
+| 把中文闲聊识别成英文并翻译（1135 条里大量错语种） | 每块自动判语种，中文就是中文 |
+| 中英混讲时按 `--language en` 强行英译 | 默认自动识别，中/英/粤语各走各的 |
+
+同一台 M1（8GB）上量到的数字：
+
+| 模型 | 加载 | 常驻 RSS | 首次解码峰值 | 中文 TTS CER | 20s 中文 RTF |
+|---|---|---|---|---|---|
+| Qwen3-ASR-0.6B-4bit | 0.6–1.0s | ~330MB | ~1.5GB | **3.9%** | 0.05–0.1 |
+| whisper-large-v3-turbo（已退役） | 4.8s | ~333MB | 2.1GB | 7.8% | ~0.3 |
+| whisper-small（已退役） | 1.9s | 876MB | 1.2GB | 5.8% | — |
+| distil-whisper-large-v3（已退役） | 3.7s | 1506MB | 2.0GB | 148.5%（只会英文） | — |
+
+Qwen3-ASR 覆盖 30 种语言 + 22 种中文方言/口音（官方口径：带口音英语词错率
+16.6% vs Whisper 21.3%，强噪声 17.9% vs 63.2%，方言 18.2% vs 44.6%），正好对上
+"带口音的汉语和英语"这个场景；8GB 内存下首次解码峰值约 1.5GB，稳态很轻。
 
 ```bash
-dsh-voice benchmark                                   # 三个模型同场对比（约 1.5 分钟）
-dsh-voice benchmark --text-file selftest/hard-lecture.txt   # 换成学术讲座稿再测一遍
-DSH_VOICE_MODEL=small dsh-voice serve                 # 换模型：turbo / distil / small
+dsh-voice doctor                              # 模型在不在、语种设置是否合理
+dsh-voice benchmark                           # 同场对比（现在只有一个模型，主要看回归）
+DSH_VOICE_MODEL=models/qwen3-asr-0.6b-4bit dsh-voice serve   # 显式指定路径
 ```
 
-`benchmark` 在**同一段音频**上量三件事：**切片延迟**（6 秒 = 一次实时提交，观众真正感觉到的那段延迟）、
-**准确率**（对照已知讲稿算 WER，且分别测干净音频和 10 dB 信噪比的加噪音频）、**峰值内存**。
-每个模型跑在独立子进程里，否则前一个模型的权重会算到后一个头上。
+### 语言：默认自动识别
 
-实测（Apple Silicon，同一份讲稿）：
+`LANGUAGE` 的默认值从 `en` 改成了**自动识别**。这是这次切换里第二重要的改动：
+旧配置把整场会议钉死成英文，讲者插一段中文就被 Whisper 强行"英译"成幻觉句。
+识别引擎逐块报语种，翻译仍然只处理英文文本。
 
-| 模型 | 大小 | 峰值内存 | WER 干净 | WER 加噪 | 6s 切片 | 20s 切片 |
-|---|---|---|---|---|---|---|
-| `turbo`（默认） | 1614M | 2147M | 0.9% | **0.9%** | 2342ms | 3118ms |
-| `distil`（仅英文） | 1509M | 2042M | 0.9% | 1.4% | 2009ms | 2367ms |
-| `small` | 481M | 1231M | 1.4% | 1.9% | **572ms** | **1154ms** |
+### 时间戳的粒度是 30 秒
 
-**结论：默认继续用 `turbo`。** 它抗噪最稳（0.9%），而 `distil` 只快 ~20%、抗噪差半档；
-`small` 快 4 倍但准确率最差——**注意这是合成语音上的数字，真实讲座音频只会让差距更大**，
-所以没有把它设成默认。三个模型都装好了，一条环境变量就能换：
+Qwen3-ASR 不输出词级时间戳，`asr.py` 以 **30 秒**为一块解码，块边界就是会议记录里
+能引用的时间精度。实时路径每窗只有几秒，不受影响；要给长录音更细的时间轴，
+把 `CHUNK_DURATION_S` 调小即可（会牺牲一点边界处的上下文）。
 
-- 想要**最短字幕延迟**、可以接受偶尔听错词 → `DSH_VOICE_MODEL=small`
-- 只要**英文**、想要折中 → `DSH_VOICE_MODEL=distil`
-- 中文/多语种或用自动识别 → 必须用 `turbo`（配错会给出**明确警告**，见 `dsh-voice doctor`）
+### 顺手挖出来的大坑：Whisper 的"感谢观看"
 
-### 顺手挖出来的一个大坑：把 temperature 钉死会关掉"救命重试"
-
-原来代码里写了 `temperature=0.0` —— 这是很常见的写法，看起来只是"要确定性输出"。
-但它同时**关掉了 Whisper 的兜底重试**：压缩比 / 对数概率那两道闸门一旦触发，
-本应升温重解，钉死 0.0 就变成"错了也认"。实测同一段音频：
-
-| 解码设置 | WER | 输出词数 |
-|---|---|---|
-| `temperature=0.0`（旧） | **72.6%** | 369（原文 215） |
-| 保留升温阶梯（新） | 4.7% | 220 |
-| 升温阶梯 + 不再喂回上文（新，两者都开） | **0.9%** | 215 |
-
-72.6% 不是"识别得差"，是**复读机**——模型在某一窗卡进循环，把同一句话重复吐了几百个词。
-而这个输入和正常输入**听起来完全一样**：两个数组最大差值只有 5e-5（16 位量化误差），
-一个 0.9%、一个 72.6%。也就是说，**同一段音频重跑一次就可能翻车**。
-
-现在两条路径都：保留升温阶梯 + `condition_on_previous_text=False`（不再把上一窗的输出喂回给下一窗，
-这正是复读的起点）。并且基准测试新增了 `worst` 列——同一段音频分别喂浮点和 16 位量化版本，
-取**较差**的那个，这样"靠运气跑对"的模型藏不住。
-
-> 这个修复的价值超过了换模型本身：它把一个"偶尔整段崩掉"的隐患变成了 0.9%。
-> 回归测试 `tests/asr_config_test.py` 会盯着这两条设置，被改回去就红。
+95 分钟录音的前言里写着约 1/3 的识别段是静音幻觉或循环重复。逐段统计：
+1536 段里 58 段为空、353 段是连续重复，最高频的句子是 "Thank you."（24 次）和
+"Loss."（42 次）——这就是 Whisper 在低信噪比音频上的经典退化，不是音量小的问题
+（全片 5 秒窗 RMS 中位数 -38 dBFS，属于远场正常水平）。
+Qwen3-ASR 不是"从不幻觉"，但它的失败形态是短词或空输出，而不是整段复读；
+实时路径仍保留静音幻觉过滤（`_HALLUCINATION_FILLERS`）作为第二道闸。
 
 ---
 
@@ -320,16 +370,15 @@ Vault 解析顺序：`--vault` → `DSH_VOICE_OBSIDIAN_VAULT` → Obsidian 注�
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `MODEL` | `models/whisper-large-v3-turbo` | 模型：`turbo` / `distil` / `small`，或任意路径 / repo |
-| `MODEL` | `turbo`（多语种） | 认 `turbo` / `distil`(仅英文) / `small`，也可直接给路径或 HF repo |
-| `LANGUAGE` | `en` | 源语言；`auto` 或空串 = 自动识别（会强制用多语种模型） |
+| `MODEL` | `models/qwen3-asr-0.6b-4bit` | 模型目录；也认标签 `qwen3`，或任意路径 / HF repo |
+| `LANGUAGE` | 空（自动识别） | 源语言；`en` / `zh` / `yue` 等可强制，空或 `auto`/`none` = 自动 |
 | `PORT` / `HOST` | `8768` / `127.0.0.1` | 服务监听地址 |
 | `TRANSLATE` | `true` | 是否翻译 |
 | `TRANSLATE_PARTIALS` | `true` | 预览句是否也翻译 |
-| `PARTIAL_INTERVAL` | `1.2` | 预览解码间隔（秒） |
+| `PARTIAL_INTERVAL` | `2.0` | 预览解码间隔（秒） |
 | `END_SILENCE_MS` | `700` | 多长静音判为一句结束 |
-| `MAX_SEGMENT` | `24` | 单段硬上限（秒） |
-| `RECORD` | `true` | 实时会话是否写入会议记录 |
+| `MAX_SEGMENT` | `20` | 单段硬上限（秒） |
+| `RECORD` | `false` | 实时会话是否写入会议记录（默认关，纪要改用整场录音离线转写） |
 | `MEETINGS_DIR` | `meetings/` | 会议记录根目录 |
 | `API_BASE` / `API_MODEL` | `https://api.deepseek.com` / `deepseek-chat` | 翻译与纪要后端 |
 | `OBSIDIAN_VAULT` | 注册表里最后打开的 vault | Obsidian vault 目录 |
@@ -361,7 +410,7 @@ dsh-voice export --vaults                      # 列出 Obsidian vault
 
 dsh-voice doctor                               # 依赖自检（含模型/语种是否匹配）
 dsh-voice benchmark [--text-file F]            # 本地模型同场对比
-dsh-voice download-model                       # 下载当前模型（约 1.6GB）
+dsh-voice download-model                       # 下载当前模型（约 0.7GB）
 dsh-voice selftest [--live]                    # 端到端自检（无需麦克风）
 ```
 
@@ -369,21 +418,30 @@ dsh-voice selftest [--live]                    # 端到端自检（无需麦克�
 
 ## 测试
 
-浏览器那三组测试需要 `DSH_HOME` 指向你的 DSH 目录（它们从 DSH 的 profile 里解析 React，
-这样模块实例和运行中的应用是同一个）。没设的话会打印它试过的路径，照着设一个就行。
+浏览器测试分两类：`plugin_render_test` / `plugin_host_test` / `plugin_session_test` 从 DSH 的 profile
+解析真实 React（模块实例与运行中的应用是同一个），需要 `DSH_HOME` 指向你的 DSH 目录，没设会打印试过的路径；
+`panel_smoke_test` 自带 React stub，不需要 profile，适合在机器上快速回归面板逻辑。
+
+本机 `node` 不在 PATH 时，用 DSH 自带的 Node 跑（把下面命令包一层 shim 即可）：
 
 ```bash
-bash tests/run_all.sh          # 离线检查（无模型、无网络，秒级，9 组）
+DSH_DESKTOP_NODE_EXECUTABLE='/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness' \
+  "/Applications/DeepSeek Harness.app/Contents/Resources/runtime/bin/node" tests/panel_smoke_test.mjs
+```
+
+```bash
+bash tests/run_all.sh          # 离线检查（无模型、无网络，秒级，8 组）
 bash tests/run_all.sh --full   # 全链路（模型 + DeepSeek API，约 3 分钟）
 
 # 也可以单独跑：
 .venv-audio/bin/python tests/meetings_test.py            # 记录存储：崩溃容错、排序、纪要渲染
 .venv-audio/bin/python tests/obsidian_export_test.py     # 笔记结构、文件名安全、重复导出
-.venv-audio/bin/python tests/asr_config_test.py          # 解码配方与模型选择（防复读回归）
+.venv-audio/bin/python tests/asr_config_test.py          # 语言映射与模型选择（防旧模型回归）
 .venv-audio/bin/python tests/benchmark_test.py           # 基准测试自身：WER 算法、加噪、推荐规则
 node tests/plugin_render_test.mjs                        # 面板渲染 + 纪要渲染器（含 XSS 安全）
 node tests/plugin_host_test.mjs                          # 守护逻辑：复用而不抢占
 node tests/plugin_session_test.mjs                       # 录音生命周期：切页面不能断（本 bug 的回归测试）
+node tests/panel_smoke_test.mjs                          # 面板纯逻辑 + 一次渲染（自带 React stub，无需 profile）
 .venv-audio/bin/python tests/live_stream_test.py         # 实时会话 + 记录一致性
 .venv-audio/bin/python tests/server_ws_test.py           # 真实 WebSocket + 会议 HTTP 接口
 .venv-audio/bin/python tests/recording_pipeline_test.py  # 录音 → 转写 → 纪要（含事实核查）
@@ -395,8 +453,8 @@ node tests/plugin_session_test.mjs                       # 录音生命周期：
 - 记录路径：**存下来的句子必须和推送给用户的事件逐字一致**，段数、译文一个都不能少。
 - 纪要路径：**说过的数字、负责人、截止时间必须出现在纪要里** —— 只对不上的措辞不算。
 - 导出路径：**重复导出只能更新同一篇笔记**，文件名不能带 Obsidian 拒绝的字符，标题不能出现两次。
-- 解码路径：**升温阶梯必须在**、**不得把上一窗输出喂回下一窗** —— 少任何一条，同一段音频就可能整段复读。
-- 模型选择：**英文专用模型绝不能喂中文**，自动识别必须落到多语种模型。
+- 解码路径：**语言提示必须映射成 Qwen3 认的名字**、**分块固定 30 秒** —— 改错会让中文被当成英文。
+- 模型选择：**catalog 里只能有 Qwen3**，旧 whisper 标签必须查找不到；默认必须落到 qwen3。
 - 面板：纪要 Markdown **永远不能变成 HTML 注入**（`<script>` 只会以文本出现）。
 
 ---

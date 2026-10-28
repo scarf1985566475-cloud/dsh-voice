@@ -1,0 +1,53 @@
+{
+  "name": "dsh-voice-interpreter",
+  "version": "0.2.0",
+  "type": "module",
+  "description": "Local speech transcription and English-to-Chinese simultaneous interpretation for DeepSeek Harness: live captions in the web client, meeting records, minutes and Obsidian export, all recognition on-device with Qwen3-ASR (MLX).",
+  "license": "MIT",
+  "author": "scarf1985566475-cloud",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/scarf1985566475-cloud/dsh-voice.git"
+  },
+  "homepage": "https://github.com/scarf1985566475-cloud/dsh-voice#readme",
+  "bugs": {
+    "url": "https://github.com/scarf1985566475-cloud/dsh-voice/issues"
+  },
+  "main": "plugin/index.js",
+  "exports": {
+    ".": "./plugin/index.js",
+    "./client": "./plugin/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "plugin/",
+    "dsh_voice/",
+    "cordis.patch.yml",
+    "pyproject.toml",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "speech-to-text",
+    "asr",
+    "speech-translation",
+    "simultaneous-interpretation",
+    "captions",
+    "qwen3-asr",
+    "mlx",
+    "macos",
+    "meeting-notes"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true
+    }
+  }
+}

@@ -1,7 +1,7 @@
 /**
  * Browser half of the voice-interpreter plugin: a "同传" conversation view.
  *
- * The panel captures the microphone, resamples it to Whisper's 16 kHz mono
+ * The panel captures the microphone, resamples it to Qwen3-ASR's 16 kHz mono
  * float32 contract, and streams it to the local dsh-voice service over a
  * WebSocket. Events come back keyed by span id, so a partial line is replaced
  * in place by its final rather than appended as a second line.
@@ -19,7 +19,7 @@ window.__ModuleLoader__.load({
 
     const React = require('react')
 
-    /** Target sample rate: Whisper's fixed input rate. */
+    /** Target sample rate: Qwen3-ASR's fixed input rate. */
     const SAMPLE_RATE = 16000
     /** Mic callback size; 2048 frames is a stable compromise across engines. */
     const FRAME_SIZE = 2048
@@ -37,6 +37,107 @@ window.__ModuleLoader__.load({
       }
     })()
     const HTTP_URL = SERVICE_URL.replace(/^ws/, 'http').replace(/\/live$/, '')
+
+    /** Panel preferences survive reloads; the service contract does not change. */
+    const PREFS_KEY = 'dsh-voice.preferences'
+    const DEFAULT_PREFS = {
+      translatePartials: true,
+      viewMode: 'bilingual',
+      fontSize: 'md',
+      follow: true,
+    }
+    const VIEW_LABELS = { bilingual: '双语', zh: '仅中文', en: '仅英文' }
+    const FONT_LABELS = { sm: '小', md: '中', lg: '大' }
+
+    /** Read stored preferences, falling back to defaults on any doubt. */
+    function loadPrefs() {
+      try {
+        const stored = JSON.parse(localStorage.getItem(PREFS_KEY) || 'null')
+        if (stored && typeof stored === 'object') return { ...DEFAULT_PREFS, ...stored }
+      } catch {
+        /* a corrupt entry is not worth failing the panel over */
+      }
+      return { ...DEFAULT_PREFS }
+    }
+
+    /** Persist preferences; a locked-down storage backend is ignored. */
+    function savePrefs(prefs) {
+      try {
+        localStorage.setItem(PREFS_KEY, JSON.stringify(prefs))
+      } catch {
+        /* private mode: preferences live for the session only */
+      }
+    }
+
+    /** ``mm:ss`` for a duration in seconds. */
+    function formatClock(seconds) {
+      const total = Math.max(0, Math.floor(Number(seconds) || 0))
+      return `${String(Math.floor(total / 60)).padStart(2, '0')}:${String(total % 60).padStart(2, '0')}`
+    }
+
+    /** Split text into ``{ text, hit }`` parts so a search term can be marked. */
+    function splitMatch(text, term) {
+      const raw = String(text || '')
+      const needle = String(term || '').trim()
+      if (!needle) return [{ text: raw, hit: false }]
+      const lower = raw.toLowerCase()
+      const target = needle.toLowerCase()
+      const parts = []
+      let cursor = 0
+      for (;;) {
+        const found = lower.indexOf(target, cursor)
+        if (found === -1) {
+          if (cursor < raw.length) parts.push({ text: raw.slice(cursor), hit: false })
+          break
+        }
+        if (found > cursor) parts.push({ text: raw.slice(cursor, found), hit: false })
+        parts.push({ text: raw.slice(found, found + needle.length), hit: true })
+        cursor = found + needle.length
+      }
+      return parts.length ? parts : [{ text: raw, hit: false }]
+    }
+
+    /** Caption rows to Markdown, with one timestamped block per row. */
+    function rowsToMarkdown(rows, title) {
+      const head = `# ${title || '同传记录'}\n\n`
+      const body = rows.map((row) => {
+        const lines = [`**[${formatClock(row.start)}]**`]
+        if (row.en) lines.push(row.en)
+        if (row.zh) lines.push(`> ${row.zh}`)
+        return lines.join('\n')
+      }).join('\n\n')
+      return `${head}${body}\n`
+    }
+
+    /** Caption rows to SRT (English then Chinese per cue). */
+    function rowsToSrt(rows) {
+      const stamp = (seconds) => {
+        const total = Math.max(0, Number(seconds) || 0)
+        const hours = String(Math.floor(total / 3600)).padStart(2, '0')
+        const minutes = String(Math.floor((total % 3600) / 60)).padStart(2, '0')
+        const secs = String(Math.floor(total % 60)).padStart(2, '0')
+        const millis = String(Math.round((total - Math.floor(total)) * 1000)).padStart(3, '0')
+        return `${hours}:${minutes}:${secs},${millis}`
+      }
+      return rows.map((row, index) => {
+        const end = Number(row.end) > Number(row.start) ? row.end : Number(row.start) + 2.5
+        const text = [row.en, row.zh].filter(Boolean).join('\n')
+        return `${index + 1}\n${stamp(row.start)} --> ${stamp(end)}\n${text}\n`
+      }).join('\n')
+    }
+
+    /** Download generated caption text without touching the service. */
+    function downloadText(filename, text, mime) {
+      const blob = new Blob([text], { type: mime || 'text/plain;charset=utf-8' })
+      const url = URL.createObjectURL(blob)
+      const anchor = document.createElement('a')
+      anchor.href = url
+      anchor.download = filename
+      document.body.appendChild(anchor)
+      anchor.click()
+      anchor.remove()
+      setTimeout(() => URL.revokeObjectURL(url), 1000)
+    }
 
     /** Panel styles. Token-based with fallbacks so light and dark themes both read well. */
     const CSS = `
@@ -121,7 +222,10 @@ window.__ModuleLoader__.load({
 .dsh-voice__meta { font-size: 12px; color: var(--dsw-alias-label-tertiary, #6e7781);
   padding: 6px 16px; border-bottom: 1px solid var(--dsw-alias-border-l1, #eaecef);
   display: flex; gap: 14px; flex-wrap: wrap; }
-.dsh-voice__log { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 14px 16px 32px; }
+.dsh-voice__head { position: sticky; top: 0; z-index: 3;
+  background: var(--dsw-alias-bg-layer-1, #fff); }
+.dsh-voice__log { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 14px 16px 32px;
+  max-height: max(240px, calc(100dvh - 230px)); overscroll-behavior: contain; }
 .dsh-voice__empty { color: var(--dsw-alias-label-tertiary, #6e7781); font-size: 13px; line-height: 1.9; }
 .dsh-voice__empty code { font-family: var(--ds-font-family-code, ui-monospace, monospace);
   background: var(--dsw-alias-bg-layer-2, #f1f3f5); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
@@ -138,6 +242,95 @@ window.__ModuleLoader__.load({
   background: rgba(207,34,46,.08); border: 1px solid rgba(207,34,46,.3); color: #a40e26; }
 .dsh-voice__banner code { font-family: var(--ds-font-family-code, ui-monospace, monospace);
   background: rgba(0,0,0,.06); padding: 1px 5px; border-radius: 4px; }
+/* ── richer live panel ─────────────────────────────────────────────── */
+.dsh-voice { position: relative; }
+.dsh-voice__dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+  margin-right: 6px; background: currentColor; vertical-align: 1px; opacity: .7; }
+.dsh-voice__status[data-state="live"] .dsh-voice__dot { opacity: 1; animation: dsh-voice-pulse 1.6s ease-in-out infinite; }
+@keyframes dsh-voice-pulse { 0%, 100% { opacity: 1 } 50% { opacity: .35 } }
+.dsh-voice__clock { font-size: 12px; color: var(--dsw-alias-label-secondary, #57606a);
+  font-family: var(--ds-font-family-code, ui-monospace, monospace); }
+.dsh-voice__chip { font-size: 11px; padding: 2px 8px; border-radius: 999px; white-space: nowrap;
+  background: var(--dsw-alias-bg-layer-2, #f1f3f5); color: var(--dsw-alias-label-secondary, #57606a);
+  border: 1px solid transparent; }
+.dsh-voice__chip[data-state="ok"] { background: rgba(23,140,80,.12); color: #14804a; }
+.dsh-voice__chip[data-state="warn"] { background: rgba(212,134,10,.14); color: #9a6700; }
+.dsh-voice__chip[data-state="rec"] { background: rgba(207,34,46,.12); color: #b3261e; }
+.dsh-voice__iconbtn { font: inherit; font-size: 12px; padding: 4px 9px; cursor: pointer; border-radius: 7px;
+  border: 1px solid var(--dsw-alias-border-l2, #d0d7de); background: transparent;
+  color: var(--dsw-alias-label-secondary, #57606a); }
+.dsh-voice__iconbtn:hover, .dsh-voice__iconbtn[data-active="1"] {
+  background: var(--dsw-alias-interactive-bg-hover, #f3f4f6); color: var(--dsw-alias-label-primary, #1f2328); }
+.dsh-voice__btn--tiny[data-active="1"] { background: rgba(212,134,10,.16); border-color: rgba(212,134,10,.4); color: #9a6700; }
+.dsh-voice__settings { display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: center;
+  padding: 10px 16px; border-bottom: 1px solid var(--dsw-alias-border-l1, #eaecef);
+  background: var(--dsw-alias-bg-layer-2, #fafbfc); }
+.dsh-voice__setgroup { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.dsh-voice__setlabel { font-size: 12px; color: var(--dsw-alias-label-tertiary, #6e7781); }
+.dsh-voice__segbtn { font: inherit; font-size: 12px; padding: 3px 9px; cursor: pointer; border-radius: 999px;
+  border: 1px solid var(--dsw-alias-border-l2, #d0d7de); background: var(--dsw-alias-bg-layer-1, #fff); color: inherit; }
+.dsh-voice__segbtn[data-active="1"] { background: rgba(9,105,218,.12); border-color: rgba(9,105,218,.45); color: #0969da; }
+.dsh-voice__sethint { font-size: 11px; color: var(--dsw-alias-label-tertiary, #8b949e); }
+.dsh-voice__searchbar { display: flex; align-items: center; gap: 8px; padding: 7px 16px;
+  border-bottom: 1px solid var(--dsw-alias-border-l1, #eaecef); }
+.dsh-voice__searchicon { font-size: 13px; color: var(--dsw-alias-label-tertiary, #8b949e); }
+.dsh-voice__input--search { min-width: 0; flex: 1 1 auto; }
+.dsh-voice__searchcount { font-size: 12px; color: var(--dsw-alias-label-tertiary, #6e7781); white-space: nowrap; }
+.dsh-voice__meta-warn { color: #b3261e; }
+.dsh-voice__rowhead { display: flex; align-items: baseline; gap: 6px; margin-bottom: 2px; }
+.dsh-voice__rowtime { font-size: 11px; color: var(--dsw-alias-label-tertiary, #8b949e);
+  font-family: var(--ds-font-family-code, ui-monospace, monospace); }
+.dsh-voice__lang { font-size: 10px; padding: 0 5px; border-radius: 4px; letter-spacing: .02em;
+  background: var(--dsw-alias-bg-layer-2, #f1f3f5); color: var(--dsw-alias-label-secondary, #57606a); }
+.dsh-voice__lang[data-lang="zh"] { background: rgba(207,34,46,.10); color: #b3261e; }
+.dsh-voice__badge { font-size: 10px; padding: 0 5px; border-radius: 4px; margin-left: 4px;
+  background: rgba(9,105,218,.10); color: #0969da; }
+.dsh-voice__badge--tr { background: rgba(212,134,10,.14); color: #9a6700; }
+.dsh-voice__row[data-final="1"] .dsh-voice__zh { font-size: 17px; }
+.dsh-voice[data-font="sm"] .dsh-voice__zh { font-size: 15px; }
+.dsh-voice[data-font="lg"] .dsh-voice__zh { font-size: 20px; }
+.dsh-voice[data-font="lg"] .dsh-voice__en { font-size: 14px; }
+.dsh-voice__zh[data-pending="1"] { opacity: .68; }
+.dsh-voice__row[data-final="0"] .dsh-voice__zh[data-pending="1"]::after { content: ""; display: inline-block;
+  width: 7px; height: 7px; margin-left: 4px; border-radius: 50%; background: currentColor;
+  animation: dsh-voice-blink 1.1s ease-in-out infinite; vertical-align: 1px; }
+@keyframes dsh-voice-blink { 0%, 100% { opacity: .2 } 50% { opacity: .9 } }
+.dsh-voice__zh-error { color: #b3261e; font-size: 14px; }
+.dsh-voice__zh { min-height: 1.5em; }
+.dsh-voice__row[data-partial="1"] { border-left-style: dashed; }
+.dsh-voice__row[data-partial="1"] .dsh-voice__zh { opacity: .6; }
+.dsh-voice__row[data-error="1"] { border-left: 3px dashed #cf222e; }
+.dsh-voice__truncnote { display: flex; align-items: center; gap: 8px; font-size: 12px;
+  padding: 8px 16px; margin: 0 0 8px; color: #9a6700; background: rgba(212,134,10,.10);
+  border-bottom: 1px solid rgba(212,134,10,.25); }
+.dsh-voice__sr { position: absolute; width: 1px; height: 1px; overflow: hidden;
+  clip-path: inset(50%); white-space: nowrap; border: 0; padding: 0; margin: -1px; }
+.dsh-voice__btn:focus-visible, .dsh-voice__iconbtn:focus-visible, .dsh-voice__segbtn:focus-visible {
+  outline: 2px solid #0969da; outline-offset: 1px; }
+.dsh-voice__mark { background: rgba(255,196,0,.35); color: inherit; padding: 0 1px; border-radius: 2px; }
+.dsh-voice__followpill { position: absolute; right: 22px; bottom: 66px; z-index: 4;
+  font: inherit; font-size: 12px; padding: 5px 12px; cursor: pointer; border-radius: 999px;
+  border: 1px solid var(--dsw-alias-border-l2, #d0d7de); background: var(--dsw-alias-bg-layer-1, #fff);
+  color: var(--dsw-alias-label-primary, #1f2328); box-shadow: 0 2px 10px rgba(0,0,0,.12); }
+.dsh-voice__footer { display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 7px 16px 9px; font-size: 11px; color: var(--dsw-alias-label-tertiary, #6e7781);
+  border-top: 1px solid var(--dsw-alias-border-l1, #eaecef); background: var(--dsw-alias-bg-layer-1, #fff); }
+.dsh-voice__footer-warn { color: #b3261e; }
+.dsh-voice__empty-card { max-width: 560px; padding: 18px 20px; border-radius: 10px;
+  border: 1px dashed var(--dsw-alias-border-l2, #d0d7de); background: var(--dsw-alias-bg-layer-1, #fff); }
+.dsh-voice__empty-title { font-size: 14px; font-weight: 600; margin-bottom: 8px; color: var(--dsw-alias-label-primary, #1f2328); }
+.dsh-voice__empty-list { margin: 0; padding-left: 18px; line-height: 1.9; }
+.dsh-voice__empty-warn { margin-top: 10px; color: #9a6700; font-size: 12px; }
+.dsh-voice__empty-hint { margin-top: 10px; font-size: 11px; color: var(--dsw-alias-label-tertiary, #8b949e); }
+@media (max-width: 720px) {
+  .dsh-voice__bar { gap: 6px; padding: 8px 10px; }
+  .dsh-voice__meta { padding: 5px 10px; gap: 8px; }
+  .dsh-voice__settings { padding: 8px 10px; }
+  .dsh-voice__searchbar { padding: 6px 10px; }
+  .dsh-voice__log { padding: 10px 10px 24px; }
+  .dsh-voice__footer { padding: 6px 10px; }
+  .dsh-voice__followpill { right: 12px; bottom: 60px; }
+}
 `
 
     const styleEl = document.createElement('style')
@@ -170,6 +363,7 @@ window.__ModuleLoader__.load({
         this.silentGain = null
         this.carry = new Float32Array(0)
         this.active = false
+        this.muted = false
       }
 
       /** Open the microphone and the socket, then start streaming. */
@@ -207,8 +401,12 @@ window.__ModuleLoader__.load({
         }
         socket.onerror = () => this.onState('error', '连接本地服务失败')
         socket.onclose = () => {
-          if (this.active) this.onState('error', '与本地服务的连接已断开')
+          if (!this.active) return
           this.active = false
+          // The service went away mid-meeting: release the microphone now
+          // instead of leaving the capture graph running against a dead socket.
+          this.stop({ graceful: false })
+          this.onState('error', '与本地服务的连接已断开')
         }
         await new Promise((resolve, reject) => {
           socket.onopen = resolve
@@ -222,6 +420,10 @@ window.__ModuleLoader__.load({
         const inRate = this.audioContext.sampleRate
         this.processor.onaudioprocess = (event) => {
           if (!this.active) return
+          if (this.muted) {
+            this.onLevel(0)
+            return
+          }
           const input = event.inputBuffer.getChannelData(0)
           let peak = 0
           for (let index = 0; index < input.length; index += 1) {
@@ -266,6 +468,15 @@ window.__ModuleLoader__.load({
         if (this.socket && this.socket.readyState === WebSocket.OPEN) {
           this.socket.send(JSON.stringify({ type: 'config', translate_partials: translatePartials }))
         }
+      }
+
+      /**
+       * Pause or resume the microphone without ending the session.
+       * @param {boolean} muted - True to stop sending audio upstream.
+       */
+      setMuted(muted) {
+        this.muted = Boolean(muted)
+        if (this.muted) this.onLevel(0)
       }
 
       /**
@@ -407,9 +618,14 @@ window.__ModuleLoader__.load({
       notice: null,
       meeting: null,
       translatePartials: true,
+      prefs: loadPrefs(),
+      muted: false,
+      startedAt: null,
+      endedAt: null,
       listeners: new Set(),
       snapshot: null,
     }
+    voiceSession.translatePartials = voiceSession.prefs.translatePartials
 
     /** Build the immutable value subscribers read. */
     function sessionSnapshot() {
@@ -423,6 +639,10 @@ window.__ModuleLoader__.load({
         notice: voiceSession.notice,
         meeting: voiceSession.meeting,
         translatePartials: voiceSession.translatePartials,
+        prefs: voiceSession.prefs,
+        muted: voiceSession.muted,
+        startedAt: voiceSession.startedAt,
+        endedAt: voiceSession.endedAt,
       }
     }
 
@@ -467,7 +687,7 @@ window.__ModuleLoader__.load({
         if (next[cursor].id === event.id) { index = cursor; break }
       }
       const row = index === -1
-        ? { id: event.id, en: '', zh: '', enFinal: false, zhFinal: false, start: 0, asr: 0, tr: 0, error: null }
+        ? { id: event.id, en: '', zh: '', enFinal: false, zhFinal: false, start: 0, end: 0, asr: 0, tr: 0, error: null, language: null }
         : next[index]
       const merged = { ...row }
       if (event.type === 'partial') {
@@ -475,11 +695,14 @@ window.__ModuleLoader__.load({
         merged.enFinal = false
         merged.start = event.start
         merged.asr = event.asr_ms
+        if (event.language) merged.language = event.language
       } else if (event.type === 'final') {
         merged.en = event.text
         merged.enFinal = true
         merged.start = event.start
+        merged.end = Number(event.end) || merged.end
         merged.asr = event.asr_ms
+        if (event.language) merged.language = event.language
         if (!event.text) { merged.zh = '（无语音）'; merged.zhFinal = true }
       } else if (event.type === 'translation') {
         merged.zh = event.text
@@ -505,6 +728,9 @@ window.__ModuleLoader__.load({
     async function sessionStart() {
       if (voiceSession.client) return
       voiceSession.notice = null
+      voiceSession.muted = false
+      voiceSession.startedAt = Date.now()
+      voiceSession.endedAt = null
       sessionPublish()
       const client = new LiveClient({
         onEvent: sessionApplyEvent,
@@ -530,6 +756,7 @@ window.__ModuleLoader__.load({
         await client.start()
         client.configure(voiceSession.translatePartials)
         voiceSession.state = 'live'
+        voiceSession.startedAt = Date.now()
         sessionPublish()
       } catch (error) {
         client.stop()
@@ -550,6 +777,8 @@ window.__ModuleLoader__.load({
       voiceSession.client = null
       voiceSession.state = 'idle'
       voiceSession.level = 0
+      voiceSession.muted = false
+      voiceSession.endedAt = Date.now()
       sessionPublish()
       if (!client) return voiceSession.meeting
       // Awaited: the flushes and translations in flight belong to the last thing
@@ -588,15 +817,24 @@ window.__ModuleLoader__.load({
      *   disabled), so the shell can refresh the records list.
      * @returns {object} The rendered element tree.
      */
-    function LivePanel({ onArchived }) {
+    function LivePanel({ onArchived, onOpenRecords }) {
       const session = React.useSyncExternalStore(
         sessionSubscribe, sessionGetSnapshot, sessionGetSnapshot,
       )
-      const { rows, state, detail, level, settings, stats, notice, meeting, translatePartials } = session
+      const {
+        rows, state, detail, level, settings, stats, notice, meeting,
+        muted, startedAt, endedAt, prefs,
+      } = session
       const [titleDraft, setTitleDraft] = React.useState(meeting ? meeting.title || '' : '')
+      const [settingsOpen, setSettingsOpen] = React.useState(false)
+      const [searchOpen, setSearchOpen] = React.useState(false)
+      const [searchTerm, setSearchTerm] = React.useState('')
+      const [now, setNow] = React.useState(Date.now())
 
       const logRef = React.useRef(null)
       const stickRef = React.useRef(true)
+      const scrollerRef = React.useRef(null)
+      const searchRef = React.useRef(null)
 
       // Follow the store's meeting: a rename, or a session started while this
       // view was detached, must not leave a stale name in the box.
@@ -605,17 +843,99 @@ window.__ModuleLoader__.load({
         setTitleDraft(meeting ? meeting.title || '' : '')
       }, [meetingId]) // eslint-disable-line react-hooks/exhaustive-deps -- draft tracks the meeting, not its title
 
+      const stateLive = state === 'live'
+      const busy = state === 'live' || state === 'connecting'
+
+      // One clock tick per second is enough for a duration readout.
       React.useEffect(() => {
-        if (!stickRef.current || !logRef.current) return
-        const element = logRef.current
-        element.scrollTop = element.scrollHeight
-      }, [rows])
+        if (!startedAt) return undefined
+        setNow(Date.now())
+        const timer = setInterval(() => setNow(Date.now()), 1000)
+        return () => clearInterval(timer)
+      }, [startedAt, endedAt])
+      const elapsed = startedAt ? Math.max(0, ((endedAt || now) - startedAt) / 1000) : 0
+
+      // A live session whose input stays at zero means the microphone is muted
+      // or blocked; surface it instead of looking stalled.
+      const quietSinceRef = React.useRef(0)
+      const [silent, setSilent] = React.useState(false)
+      React.useEffect(() => {
+        if (!stateLive) {
+          quietSinceRef.current = 0
+          setSilent(false)
+          return undefined
+        }
+        const timer = setInterval(() => {
+          if (level > 0.001) {
+            quietSinceRef.current = 0
+            setSilent(false)
+            return
+          }
+          if (!quietSinceRef.current) quietSinceRef.current = Date.now()
+          setSilent(Date.now() - quietSinceRef.current > 3000)
+        }, 1000)
+        return () => clearInterval(timer)
+      }, [stateLive, level])
+
+      const updatePrefs = React.useCallback((patch) => {
+        voiceSession.prefs = { ...voiceSession.prefs, ...patch }
+        savePrefs(voiceSession.prefs)
+        if (patch.translatePartials !== undefined) {
+          voiceSession.translatePartials = patch.translatePartials
+          if (voiceSession.client) voiceSession.client.configure(patch.translatePartials)
+        }
+        sessionPublish()
+      }, [])
+
+      /** Resolve the element whose scrollbar moves the captions. */
+      const resolveScroller = React.useCallback(() => {
+        let node = logRef.current
+        while (node && node !== document.body && node !== document.documentElement) {
+          if (node.scrollHeight > node.clientHeight + 2) return node
+          node = node.parentElement
+        }
+        return document.scrollingElement || document.documentElement
+      }, [])
 
       const onScroll = React.useCallback(() => {
-        const element = logRef.current
-        if (!element) return
-        stickRef.current = element.scrollHeight - element.scrollTop - element.clientHeight < 80
-      }, [])
+        const node = scrollerRef.current
+        if (!node) return
+        const atBottom = node.scrollHeight - node.scrollTop - node.clientHeight < 80
+        stickRef.current = atBottom
+        if (atBottom !== voiceSession.prefs.follow) updatePrefs({ follow: atBottom })
+      }, [updatePrefs])
+
+      // Follow the newest caption, unless the viewer scrolled away.
+      React.useEffect(() => {
+        if (!rows.length) {
+          stickRef.current = voiceSession.prefs.follow
+          return
+        }
+        if (!voiceSession.prefs.follow || !stickRef.current) return
+        const node = scrollerRef.current || resolveScroller()
+        if (!node) return
+        node.scrollTop = node.scrollHeight
+      }, [rows, resolveScroller])
+
+      // Bind the stickiness listener to whichever element owns the scrollbar.
+      React.useEffect(() => {
+        const node = resolveScroller()
+        if (!node || node === scrollerRef.current) return
+        if (scrollerRef.current) scrollerRef.current.removeEventListener('scroll', onScroll)
+        scrollerRef.current = node
+        node.addEventListener('scroll', onScroll, { passive: true })
+      }, [rows, resolveScroller, onScroll]) // eslint-disable-line react-hooks/exhaustive-deps -- node identity can change without rows
+
+      React.useEffect(() => {
+        if (searchOpen) searchRef.current?.focus()
+      }, [searchOpen])
+
+      const gotoLatest = React.useCallback(() => {
+        const node = scrollerRef.current || resolveScroller()
+        if (node) node.scrollTop = node.scrollHeight
+        stickRef.current = true
+        updatePrefs({ follow: true })
+      }, [resolveScroller, updatePrefs])
 
       const toggle = React.useCallback(async () => {
         if (voiceSession.client) {
@@ -626,12 +946,15 @@ window.__ModuleLoader__.load({
         await sessionStart()
       }, [onArchived])
 
-      const onPartialToggle = React.useCallback((event) => {
-        const next = event.target.checked
-        voiceSession.translatePartials = next
+      const toggleMute = React.useCallback(() => {
+        voiceSession.muted = !voiceSession.muted
+        if (voiceSession.client) voiceSession.client.setMuted(voiceSession.muted)
         sessionPublish()
-        if (voiceSession.client) voiceSession.client.configure(next)
       }, [])
+
+      const onPartialToggle = React.useCallback((event) => {
+        updatePrefs({ translatePartials: event.target.checked })
+      }, [updatePrefs])
 
       const rename = React.useCallback(() => {
         const title = titleDraft.trim()
@@ -642,48 +965,184 @@ window.__ModuleLoader__.load({
       }, [titleDraft])
 
       const copyAll = React.useCallback(() => {
-        const text = rows
-          .map((row) => [row.en, row.zh].filter(Boolean).join('\n'))
-          .filter(Boolean)
-          .join('\n\n')
-        if (!text) return
-        navigator.clipboard?.writeText(text).catch(() => {})
+        if (!rows.length) return
+        navigator.clipboard?.writeText(rowsToMarkdown(rows, meeting && meeting.title)).catch(() => {})
+      }, [rows, meeting])
+
+      const exportMarkdown = React.useCallback(() => {
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 16)
+        downloadText(`dsh-voice-${stamp}.md`, rowsToMarkdown(rows, meeting && meeting.title), 'text/markdown;charset=utf-8')
+      }, [rows, meeting])
+
+      const exportSrt = React.useCallback(() => {
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 16)
+        downloadText(`dsh-voice-${stamp}.srt`, rowsToSrt(rows), 'text/plain;charset=utf-8')
       }, [rows])
 
-      const live = state === 'live' || state === 'connecting'
+      // Shortcuts: space starts/stops, M mutes, / searches, F jumps to latest.
+      React.useEffect(() => {
+        const onKey = (event) => {
+          const target = event.target
+          const typing = target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)
+          if (event.key === 'Escape' && searchOpen) {
+            setSearchOpen(false)
+            setSearchTerm('')
+            return
+          }
+          if (typing) return
+          if (event.key === ' ') {
+            event.preventDefault()
+            toggle()
+          } else if (event.key.toLowerCase() === 'm' && stateLive) {
+            toggleMute()
+          } else if (event.key.toLowerCase() === 'f') {
+            gotoLatest()
+          } else if (event.key === '/') {
+            event.preventDefault()
+            setSearchOpen(true)
+          }
+        }
+        window.addEventListener('keydown', onKey)
+        return () => window.removeEventListener('keydown', onKey)
+      }, [toggle, toggleMute, gotoLatest, searchOpen, stateLive])
+
+      const term = searchTerm.trim()
+      const visibleRows = term
+        ? rows.filter((row) => `${row.en} ${row.zh}`.toLowerCase().includes(term.toLowerCase()))
+        : rows
+      const failedTranslations = rows.filter((row) => row.error).length
+      const average = (key) => {
+        const values = rows.map((row) => Number(row[key]) || 0).filter((value) => value > 0)
+        return values.length ? Math.round(values.reduce((sum, value) => sum + value, 0) / values.length) : 0
+      }
+      const LANG_BADGE = { en: 'EN', zh: '中', yue: '粤', ja: '日', ko: '韩', fr: '法', de: '德', es: '西', ru: '俄', it: '意', pt: '葡' }
+      const langLabel = (code) => LANG_BADGE[code] || (code ? String(code).toUpperCase() : '')
+      const withMatch = (text) => splitMatch(text, searchTerm).map((part, index) => (
+        part.hit
+          ? React.createElement('mark', { key: index, className: 'dsh-voice__mark' }, part.text)
+          : part.text
+      ))
+
+      const statusText = state === 'live'
+        ? (muted ? '已暂停收音' : silent ? '未检测到声音 · 检查麦克风' : '监听中')
+        : STATE_LABEL[state]
+      const chips = []
+      if (settings) {
+        chips.push(React.createElement('span', {
+          key: 'model', className: 'dsh-voice__chip', title: settings.model_repo || '',
+          'data-state': settings.model_ready ? 'ok' : 'warn',
+        }, settings.model_ready ? 'Qwen3 · 本机' : '模型未下载'))
+        chips.push(React.createElement('span', {
+          key: 'translate', className: 'dsh-voice__chip', title: settings.api_model || '',
+          'data-state': settings.translation_available ? 'ok' : 'warn',
+        }, settings.translation_available ? '英译中 · DeepSeek' : '翻译未配置'))
+        if (settings.record) {
+          chips.push(React.createElement('span', {
+            key: 'record', className: 'dsh-voice__chip', 'data-state': 'rec',
+          }, meeting ? `记录 #${meeting.id}` : '记录中'))
+        }
+      }
+
       const header = React.createElement('div', { className: 'dsh-voice__bar' },
         React.createElement('span', { className: 'dsh-voice__title' }, '同声传译'),
         React.createElement('span', {
           className: 'dsh-voice__status',
+          role: 'status',
           'data-state': state === 'live' ? 'live' : state === 'error' ? 'error' : state === 'idle' ? '' : 'ready',
-        }, `${STATE_LABEL[state]}${state === 'error' && detail ? ` · ${detail}` : ''}`),
-        React.createElement('div', { className: 'dsh-voice__meter' },
-          React.createElement('i', { style: { width: `${Math.min(100, level * 140)}%` } })),
+        },
+        React.createElement('i', { className: 'dsh-voice__dot' }),
+        statusText + (state === 'error' && detail ? ` · ${detail}` : '')),
+        startedAt ? React.createElement('span', { className: 'dsh-voice__clock', title: '本次会话时长' }, formatClock(elapsed)) : null,
+        stateLive ? React.createElement('div', { className: 'dsh-voice__meter', title: '麦克风电平', 'aria-hidden': 'true' },
+          React.createElement('i', { style: { width: `${Math.min(100, level * 140)}%` } })) : null,
         React.createElement('div', { className: 'dsh-voice__spacer' }),
-        React.createElement('label', { className: 'dsh-voice__check' },
-          React.createElement('input', { type: 'checkbox', checked: translatePartials, onChange: onPartialToggle }),
-          '预览也翻译'),
-        React.createElement('button', { className: 'dsh-voice__btn', onClick: copyAll, disabled: rows.length === 0 }, '复制'),
-        React.createElement('button', { className: 'dsh-voice__btn', onClick: sessionClearRows, disabled: rows.length === 0 }, '清空'),
+        ...chips,
         React.createElement('button', {
-          className: 'dsh-voice__btn',
-          'data-primary': '1',
-          'data-live': live ? '1' : '0',
+          className: 'dsh-voice__iconbtn', title: '搜索字幕（/）',
+          'data-active': searchOpen ? '1' : '0',
+          onClick: () => setSearchOpen((open) => !open),
+        }, '搜索'),
+        React.createElement('button', {
+          className: 'dsh-voice__iconbtn', title: '面板设置',
+          'data-active': settingsOpen ? '1' : '0',
+          onClick: () => setSettingsOpen((open) => !open),
+        }, '设置'),
+        React.createElement('button', { className: 'dsh-voice__btn dsh-voice__btn--tiny', onClick: copyAll, disabled: rows.length === 0 }, '复制'),
+        React.createElement('button', { className: 'dsh-voice__btn dsh-voice__btn--tiny', onClick: sessionClearRows, disabled: rows.length === 0 }, '清空'),
+        stateLive ? React.createElement('button', {
+          className: 'dsh-voice__btn dsh-voice__btn--tiny',
+          'data-active': muted ? '1' : '0',
+          onClick: toggleMute,
+          title: '暂停/恢复收音（M）',
+        }, muted ? '恢复收音' : '暂停收音') : null,
+        React.createElement('button', {
+          className: 'dsh-voice__btn', 'data-primary': '1', 'data-live': busy ? '1' : '0',
+          disabled: state === 'connecting',
           onClick: toggle,
-        }, live ? '停止' : '开始收听'),
+        }, state === 'connecting' ? '连接中…' : busy ? '停止' : '开始收听'),
       )
+
+      const settingsRow = settingsOpen ? React.createElement('div', { className: 'dsh-voice__settings' },
+        React.createElement('div', { className: 'dsh-voice__setgroup' },
+          React.createElement('span', { className: 'dsh-voice__setlabel' }, '显示'),
+          ['bilingual', 'zh', 'en'].map((id) => React.createElement('button', {
+            key: id, className: 'dsh-voice__segbtn',
+            'data-active': prefs.viewMode === id ? '1' : '0',
+            onClick: () => updatePrefs({ viewMode: id }),
+          }, VIEW_LABELS[id]))),
+        React.createElement('div', { className: 'dsh-voice__setgroup' },
+          React.createElement('span', { className: 'dsh-voice__setlabel' }, '字号'),
+          ['sm', 'md', 'lg'].map((id) => React.createElement('button', {
+            key: id, className: 'dsh-voice__segbtn',
+            'data-active': prefs.fontSize === id ? '1' : '0',
+            onClick: () => updatePrefs({ fontSize: id }),
+          }, FONT_LABELS[id]))),
+        React.createElement('div', { className: 'dsh-voice__setgroup' },
+          React.createElement('label', { className: 'dsh-voice__check' },
+            React.createElement('input', {
+              type: 'checkbox', checked: prefs.follow,
+              onChange: (event) => updatePrefs({ follow: event.target.checked }),
+            }), '自动跟随最新字幕'),
+          React.createElement('label', { className: 'dsh-voice__check' },
+            React.createElement('input', {
+              type: 'checkbox', checked: prefs.translatePartials,
+              onChange: onPartialToggle,
+            }), '预览（未定稿）也翻译')),
+        React.createElement('div', { className: 'dsh-voice__setgroup' },
+          React.createElement('span', { className: 'dsh-voice__setlabel' }, '导出'),
+          React.createElement('button', { className: 'dsh-voice__btn dsh-voice__btn--tiny', onClick: exportMarkdown, disabled: rows.length === 0 }, 'Markdown'),
+          React.createElement('button', { className: 'dsh-voice__btn dsh-voice__btn--tiny', onClick: exportSrt, disabled: rows.length === 0 }, 'SRT')),
+        React.createElement('div', { className: 'dsh-voice__setgroup dsh-voice__sethint' },
+          '快捷键：空格 开始/停止 · M 暂停收音 · / 搜索 · F 回到最新'),
+      ) : null
+
+      const searchRow = (searchOpen || term) ? React.createElement('div', { className: 'dsh-voice__searchbar' },
+        React.createElement('span', { className: 'dsh-voice__searchicon' }, '⌕'),
+        React.createElement('input', {
+          ref: searchRef,
+          className: 'dsh-voice__input dsh-voice__input--search',
+          value: searchTerm,
+          placeholder: '搜索英文字幕或中文译文（Esc 清除）',
+          onChange: (event) => setSearchTerm(event.target.value),
+        }),
+        term ? React.createElement('span', { className: 'dsh-voice__searchcount' }, `${visibleRows.length}/${rows.length}`) : null,
+        React.createElement('button', {
+          className: 'dsh-voice__btn dsh-voice__btn--tiny',
+          onClick: () => { setSearchTerm(''); setSearchOpen(false) },
+        }, '关闭'),
+      ) : null
 
       const meta = React.createElement('div', { className: 'dsh-voice__meta' },
         React.createElement('span', null, `服务 ${HTTP_URL}`),
-        React.createElement('span', null, settings
-          ? (settings.model_ready ? '模型已就绪' : '模型未下载')
-          : '未连接'),
-        React.createElement('span', null, settings && settings.translation_available ? `翻译 ${settings.api_model}` : '翻译不可用'),
+        React.createElement('span', null, settings && settings.language ? `语言 ${settings.language}` : '语言 自动识别'),
+        React.createElement('span', null, settings ? (settings.model_ready ? '模型已就绪' : '模型未下载') : '未连接'),
         stats ? React.createElement('span', null, `已识别 ${stats.segments} 段`) : null,
-        stats ? React.createElement('span', null, `识别 ${stats.last_asr_ms}ms`) : null,
-        stats ? React.createElement('span', null, `翻译 ${stats.last_translate_ms}ms`) : null,
-        settings ? React.createElement('span', null, settings.record ? '正在记录会议' : '未开启记录') : null,
-        meeting ? React.createElement('span', null, `记录 #${meeting.id}`) : null,
+        stats ? React.createElement('span', null, `ASR 平均 ${average('asr')}ms · 最近 ${stats.last_asr_ms}ms`) : null,
+        stats ? React.createElement('span', null, `翻译 平均 ${average('tr')}ms · 最近 ${stats.last_translate_ms}ms`) : null,
+        stats && stats.dropped_hallucinations
+          ? React.createElement('span', null, `丢弃幻觉 ${stats.dropped_hallucinations}`) : null,
+        stats && stats.failed_translations
+          ? React.createElement('span', { className: 'dsh-voice__meta-warn' }, `翻译失败 ${stats.failed_translations}`) : null,
       )
 
       const titleRow = meeting
@@ -702,39 +1161,71 @@ window.__ModuleLoader__.load({
               disabled: !titleDraft.trim() || titleDraft === meeting.title,
             }, '保存名称'),
             React.createElement('span', { className: 'dsh-voice__titlerow-hint' },
-              live ? '停止后会自动存档，可在「会议记录」里生成纪要' : '已存档，可在「会议记录」里生成纪要'),
+              busy ? '停止后会自动存档，可在「会议记录」里生成纪要' : '已存档，可在「会议记录」里生成纪要'),
           )
         : null
 
+      const empty = React.createElement('div', { className: 'dsh-voice__empty' },
+        React.createElement('div', { className: 'dsh-voice__empty-card' },
+          React.createElement('div', { className: 'dsh-voice__empty-title' }, '开始一场同声传译'),
+          React.createElement('ul', { className: 'dsh-voice__empty-list' },
+            React.createElement('li', null, '点击「开始收听」并授权麦克风，即可实时看到字幕。'),
+            React.createElement('li', null, '本机 Qwen3-ASR 自动识别中英文口音；DeepSeek 负责英译中。'),
+            React.createElement('li', null, '停止后自动存档，可在「会议记录」里生成纪要或导出。'),
+          ),
+          settings && settings.model_ready === false
+            ? React.createElement('div', { className: 'dsh-voice__empty-warn' },
+                '模型尚未下载：运行 ', React.createElement('code', null, 'dsh-voice download-model'), '（约 0.7GB）。')
+            : null,
+          React.createElement('div', { className: 'dsh-voice__empty-hint' },
+            '快捷键：空格 开始/停止 · M 暂停收音 · / 搜索 · F 回到最新'),
+        ),
+      )
+
       const body = rows.length === 0
-        ? React.createElement('div', { className: 'dsh-voice__empty' },
-            React.createElement('div', null, '点击「开始收听」，对着麦克风说英语，这里会实时显示英文字幕与中文译文。'),
-            React.createElement('div', null, '音频与识别全部在本机完成；只有英文句子会发送给 DeepSeek 做翻译。'),
-            settings && settings.model_ready === false
-              ? React.createElement('div', null, '模型尚未下载：运行 ',
-                  React.createElement('code', null, 'dsh-voice download-model'), '（约 1.6GB）。')
-              : null,
-          )
-        : rows.map((row) => React.createElement('div', {
-            key: row.id,
-            className: 'dsh-voice__row',
-            'data-final': row.enFinal ? '1' : '0',
-          },
-          React.createElement('div', { className: 'dsh-voice__en' }, row.en || '…'),
-          React.createElement('div', {
-            className: 'dsh-voice__zh',
-            'data-pending': row.zhFinal ? '0' : '1',
-          }, row.zh || (row.enFinal ? '' : '')),
-          React.createElement('div', {
-            className: 'dsh-voice__rowmeta',
-            'data-error': row.error ? '1' : '0',
-          }, [
-            row.enFinal ? `${Number(row.start).toFixed(1)}s` : '识别中',
-            row.asr ? `ASR ${row.asr}ms` : null,
-            row.tr ? `译 ${row.tr}ms` : null,
-            row.error,
-          ].filter(Boolean).join(' · ')),
-        ))
+        ? empty
+        : (visibleRows.length === 0
+          ? React.createElement('div', { className: 'dsh-voice__empty' }, '没有匹配的字幕。')
+          : visibleRows.map((row) => {
+              const showEn = prefs.viewMode !== 'zh'
+              const showZh = prefs.viewMode !== 'en'
+              return React.createElement('div', {
+                key: row.id,
+                className: 'dsh-voice__row',
+                'data-final': row.enFinal ? '1' : '0',
+                'data-partial': row.enFinal ? '0' : '1',
+                'data-error': row.error ? '1' : '0',
+              },
+              React.createElement('div', { className: 'dsh-voice__rowhead' },
+                React.createElement('span', { className: 'dsh-voice__rowtime', title: '句首时间' }, formatClock(row.start)),
+                row.language
+                  ? React.createElement('span', { className: 'dsh-voice__lang', 'data-lang': row.language }, langLabel(row.language))
+                  : null,
+                React.createElement('span', { className: 'dsh-voice__spacer' }),
+                row.enFinal ? null : React.createElement('span', { className: 'dsh-voice__badge' }, '识别中'),
+                row.enFinal && !row.zhFinal && showZh
+                  ? React.createElement('span', { className: 'dsh-voice__badge dsh-voice__badge--tr' }, '翻译中')
+                  : null,
+              ),
+              showEn ? React.createElement('div', { className: 'dsh-voice__en' }, withMatch(row.en || '…')) : null,
+              showZh ? React.createElement('div', {
+                className: 'dsh-voice__zh',
+                'data-pending': row.zhFinal ? '0' : '1',
+              },
+              row.error && !row.zh
+                ? React.createElement('span', { className: 'dsh-voice__zh-error' }, `⚠ 翻译失败：${row.error}`)
+                : (row.zh || (row.enFinal ? (row.zhFinal ? '（无语音）' : '译中…') : '翻译中…'))) : null,
+              React.createElement('div', {
+                className: 'dsh-voice__rowmeta',
+                'data-error': row.error ? '1' : '0',
+              }, [
+                row.enFinal ? '最终' : '实时',
+                row.asr ? `ASR ${row.asr}ms` : null,
+                row.tr ? `译 ${row.tr}ms` : null,
+                row.error,
+              ].filter(Boolean).join(' · ')),
+              )
+            }))
 
       const banner = notice
         ? React.createElement('div', { className: 'dsh-voice__banner' },
@@ -743,15 +1234,63 @@ window.__ModuleLoader__.load({
               React.createElement('code', null, 'dsh-voice serve'),
               '（或在对话中让我启动它）。'),
             detail ? React.createElement('div', null, detail) : null,
+            state === 'error'
+              ? React.createElement('button', {
+                  className: 'dsh-voice__btn dsh-voice__btn--tiny',
+                  style: { marginTop: '8px' },
+                  onClick: toggle,
+                }, '重试')
+              : null,
           )
         : null
 
-      return React.createElement('div', { className: 'dsh-voice' },
-        header,
-        meta,
-        titleRow,
+      const footer = rows.length
+        ? React.createElement('div', { className: 'dsh-voice__footer' },
+            React.createElement('span', { className: 'dsh-voice__privacy' },
+              '音频与识别在本机完成；仅英文片段会发送给 DeepSeek 翻译。'),
+            React.createElement('span', { className: 'dsh-voice__spacer' }),
+            React.createElement('span', null, `${rows.length} 段`),
+            startedAt ? React.createElement('span', null, `时长 ${formatClock(elapsed)}`) : null,
+            failedTranslations ? React.createElement('span', { className: 'dsh-voice__footer-warn' }, `翻译失败 ${failedTranslations}`) : null,
+            !busy && meeting && onOpenRecords
+              ? React.createElement('button', {
+                  className: 'dsh-voice__btn dsh-voice__btn--tiny',
+                  onClick: onOpenRecords,
+                }, '查看会议记录')
+              : null,
+          )
+        : null
+
+      const followPill = rows.length && !prefs.follow
+        ? React.createElement('button', { className: 'dsh-voice__followpill', onClick: gotoLatest }, '↓ 回到最新')
+        : null
+
+      const truncated = rows.length >= MAX_ROWS
+      const truncNote = truncated
+        ? React.createElement('div', { className: 'dsh-voice__truncnote' },
+            React.createElement('span', null, `仅显示最近 ${MAX_ROWS} 句，更早的句子在会议存档里。`),
+            onOpenRecords
+              ? React.createElement('button', { className: 'dsh-voice__btn dsh-voice__btn--tiny', onClick: onOpenRecords }, '查看会议记录')
+              : null)
+        : null
+
+      const lastFinalZh = rows.length
+        ? [...rows].reverse().find((row) => row.enFinal && row.zh)
+        : null
+
+      return React.createElement('div', { className: 'dsh-voice', 'data-font': prefs.fontSize },
+        React.createElement('div', { className: 'dsh-voice__head' },
+          header, settingsRow, searchRow, meta, titleRow),
         banner,
-        React.createElement('div', { className: 'dsh-voice__log', ref: logRef, onScroll }, body),
+        React.createElement('div', {
+          className: 'dsh-voice__log', ref: logRef, onScroll,
+          role: 'log', 'aria-live': 'off', 'aria-label': '实时字幕',
+        }, truncated ? [truncNote, body] : body),
+        React.createElement('div', {
+          className: 'dsh-voice__sr', 'aria-live': 'polite', 'aria-atomic': 'true',
+        }, lastFinalZh ? lastFinalZh.zh : ''),
+        followPill,
+        footer,
       )
     }
 
@@ -1111,7 +1650,7 @@ window.__ModuleLoader__.load({
         React.createElement('div', {
           className: 'dsh-voice__host',
           style: { display: mode === 'live' ? 'flex' : 'none' },
-        }, React.createElement(LivePanel, { onArchived })),
+        }, React.createElement(LivePanel, { onArchived, onOpenRecords: () => setMode('meetings') })),
         React.createElement('div', {
           className: 'dsh-voice__host',
           style: { display: mode === 'meetings' ? 'flex' : 'none' },
@@ -1147,12 +1686,14 @@ window.__ModuleLoader__.load({
     // and keeps the minutes renderer verifiable without a browser.
     exports.__internal = {
       renderMinutes, renderInline, formatDuration, formatStamp, fetchJson,
+      loadPrefs, savePrefs, formatClock, splitMatch, rowsToMarkdown, rowsToSrt,
+      DEFAULT_PREFS,
       // The live session is app-scoped state, so the render harness can drive it
       // without mounting a component — which is exactly the property that keeps
       // a recording alive across navigation.
       voiceSession, sessionStart, sessionStop, sessionDispose, sessionApplyEvent,
       sessionSubscribe, sessionGetSnapshot, sessionPublish, sessionClearRows,
-      LiveClient,
+      LiveClient, LivePanel,
     }
     return module.exports
   },

@@ -1,0 +1,18 @@
+# dsh-voice-interpreter — roster patch merged into the profile by `dsh plugin add`.
+#
+# Mounts the host half of the plugin, which supervises the local dsh-voice
+# service the live panel talks to. The Python backend cannot be installed by the
+# plugin manager, so tell the supervisor where it lives either by exporting
+#
+#   DSH_VOICE_PROJECT   checkout / installed package directory
+#   DSH_VOICE_PYTHON    interpreter with dsh_voice installed
+#
+# or by adding "projectDir" / "python" to the config below. With neither set the
+# plugin only warns and expects `dsh-voice serve` started by hand.
+- insert:
+    - id: dsh-voice-interpreter
+      name: 'dsh-voice-interpreter'
+      config:
+        host: 127.0.0.1
+        port: 8768
+        autoStart: true

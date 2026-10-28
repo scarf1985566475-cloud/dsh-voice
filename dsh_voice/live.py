@@ -2,7 +2,7 @@
 
 Pipeline, per connection::
 
-    browser mic -> PCM frames -> rolling window -> MLX Whisper
+    browser mic -> PCM frames -> rolling window -> Qwen3-ASR
                                                -> commit stable sentences
                                                -> DeepSeek (EN->ZH) -> JSON events
 
@@ -55,11 +55,80 @@ QUEUE_LIMIT = 12
 TICK_S = 0.2
 
 #: A decoded sentence is committed once its end trails the audio frontier by
-#: this much, because a later decode would land on the same words.
-COMMIT_MARGIN_S = 1.0
+#: this much, because a later decode would land on the same words. Shorter than
+#: a second: every extra moment here is caption latency the viewer feels.
+COMMIT_MARGIN_S = 0.6
+
+#: Longest span a *preview* decode may cover. A preview re-decodes the open
+#: window every partial interval, so on a slow (or memory-pressured) machine an
+#: uncapped window turns the preview loop into a backlog that never drains.
+#: Oversized windows are shown as their tail only: display only, while the
+#: commit still comes from a flush or a full-window preview.
+PREVIEW_MAX_WINDOW_S = 6.0
+
+#: Preview gain applied to every decode window. A far-field or quiet microphone
+#: hands the recognizer amplitudes well under its speech range, and on that signal the
+#: decoder falls into repetition loops; lifting the window toward -20 dBFS
+#: before decoding removes them. The peak ceiling and the gain cap keep a silent
+#: window from turning its noise floor into a shout.
+TARGET_RMS_DB = -20.0
+MAX_GAIN_DB = 18.0
+PEAK_CEILING = 0.98
+
+#: The recognizer's stock answers to non-speech audio. A span is dropped only when its
+#: text is one of these *and* its audio is markedly quieter than speech in the
+#: same window, so a real "thank you" at normal level survives.
+_HALLUCINATION_FILLERS = frozenset({
+    "thank you",
+    "thanks",
+    "thank you very much",
+    "thank you so much",
+    "thanks for watching",
+    "thank you for watching",
+    "please subscribe",
+    "cheers",
+    "bye",
+})
 
 #: Sentence-final characters used to avoid committing an unfinished clause.
 _SENTENCE_ENDINGS = (".", "!", "?", "。", "！", "？", "…")
+
+
+def _rms(audio: np.ndarray) -> float:
+    """Root-mean-square level of a waveform (0.0 for empty input)."""
+    if audio.size == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(np.square(audio, dtype=np.float64))))
+
+
+def _normalized_text(text: str) -> str:
+    """Collapse a caption to its comparable form: lowercase, no edge punctuation."""
+    return " ".join(text.lower().split()).strip(" .,!?…:;\"'")
+
+
+def _boost_for_decode(audio: np.ndarray) -> tuple[np.ndarray, float]:
+    """Scale a decode window toward :data:`TARGET_RMS_DB`, gain only and peak-safe.
+
+    Args:
+        audio: The window about to be decoded, mono float32 in [-1, 1].
+
+    Returns:
+        The audio to decode and the applied gain in dB (``0.0`` when the window
+        was already at or above the target and was left untouched).
+    """
+    level = _rms(audio)
+    if level <= 1e-6:
+        return audio, 0.0
+    gain = (10.0 ** (TARGET_RMS_DB / 20.0)) / level
+    if gain <= 1.0:
+        return audio, 0.0
+    peak = float(np.max(np.abs(audio)))
+    if peak > 0:
+        gain = min(gain, PEAK_CEILING / peak)
+    gain = min(gain, 10.0 ** (MAX_GAIN_DB / 20.0))
+    if gain <= 1.0:
+        return audio, 0.0
+    return (audio * gain).astype(np.float32), 20.0 * float(np.log10(gain))
 
 #: Bound on how long shutdown waits for an in-flight decode and translation.
 SHUTDOWN_TIMEOUT_S = 45.0
@@ -88,6 +157,7 @@ class SessionStats:
     translations: int = 0
     failed_translations: int = 0
     dropped_stale: int = 0
+    dropped_hallucinations: int = 0
     audio_seconds: float = 0.0
     last_asr_ms: int = 0
     last_translate_ms: int = 0
@@ -100,6 +170,7 @@ class SessionStats:
             "translations": self.translations,
             "failed_translations": self.failed_translations,
             "dropped_stale": self.dropped_stale,
+            "dropped_hallucinations": self.dropped_hallucinations,
             "audio_seconds": round(self.audio_seconds, 2),
             "last_asr_ms": self.last_asr_ms,
             "last_translate_ms": self.last_translate_ms,
@@ -113,6 +184,8 @@ class _DecodedSentence:
     start_sample: int
     end_sample: int
     text: str
+    #: Detected language code (``en``/``zh``/...), carried to the client badge.
+    language: str | None = None
 
 
 class LiveSession:
@@ -172,6 +245,11 @@ class LiveSession:
         self._partial_translated_at = 0.0
         self._context: list[str] = []
         self._translate_partials = settings.translate_partials
+        self._translate_tasks: set[asyncio.Task[None]] = set()
+        self._last_committed_text = ""
+        #: The language the decoder reported for the newest window, reused for
+        #: previews and flush tails that were decoded from older windows.
+        self._last_language: str | None = None
 
     # ── lifecycle ────────────────────────────────────────────────────────────
 
@@ -235,6 +313,10 @@ class LiveSession:
                 await self._process(job)
             if job.done is not None and not job.done.done():
                 job.done.set_result(None)
+        if self._translate_tasks:
+            # Translations now run off the decode worker; let the last ones land
+            # before the record is finalized and the HTTP client is closed.
+            await asyncio.gather(*list(self._translate_tasks), return_exceptions=True)
         if self.recorder is not None:
             # Finalized last, so the record's segment count and end time include
             # everything the drain just committed.
@@ -309,7 +391,13 @@ class LiveSession:
                 # A decode is already pending; a stale preview is not worth queueing.
                 continue
             self._last_preview_end = self._consumed
-            await self._jobs.put(_Job(kind="preview", start_sample=self._committed, end_sample=self._consumed))
+            # Bound the preview decode. An unbounded rolling window is the
+            # failure mode on a machine that cannot decode faster than it
+            # listens: the queue never drains and captions arrive seconds late.
+            # An oversized window is previewed as its tail only (display-only in
+            # _process); the commit still comes from a flush.
+            preview_start = max(self._committed, self._consumed - int(PREVIEW_MAX_WINDOW_S * SAMPLE_RATE))
+            await self._jobs.put(_Job(kind="preview", start_sample=preview_start, end_sample=self._consumed))
 
     async def _worker_loop(self) -> None:
         """Decode and translate queued jobs in order until the sentinel arrives."""
@@ -368,10 +456,14 @@ class LiveSession:
             end = window_start + int(segment.end * SAMPLE_RATE)
             if end <= start:
                 end = min(job.end_sample, start + int(0.2 * SAMPLE_RATE))
-            sentences.append(_DecodedSentence(start_sample=start, end_sample=end, text=segment.text))
+            sentences.append(_DecodedSentence(
+                start_sample=start, end_sample=end, text=segment.text,
+                language=transcript.language,
+            ))
         if not sentences and transcript.text.strip():
             sentences.append(_DecodedSentence(
                 start_sample=window_start, end_sample=job.end_sample, text=transcript.text.strip(),
+                language=transcript.language,
             ))
         return sentences
 
@@ -401,6 +493,46 @@ class LiveSession:
         ).strip()
         return stable, tail
 
+    def _drop_hallucinations(
+        self,
+        sentences: list[_DecodedSentence],
+        audio: np.ndarray,
+        window_start: int,
+    ) -> list[_DecodedSentence]:
+        """Discard filler output on noise and immediate repeats.
+
+        On a quiet or far-field microphone the decoder answers near-silence with
+        a small vocabulary of stock phrases. A span is dropped only when its text
+        is one of those phrases *and* its audio is markedly quieter than the
+        window's speech level, so a genuine thank-you at normal volume survives.
+        A sentence identical to the one just committed is also dropped: that is
+        the other shape of the same repetition loop.
+        """
+        if not sentences:
+            return sentences
+        window_level = _rms(audio)
+        kept: list[_DecodedSentence] = []
+        previous = self._last_committed_text
+        for sentence in sentences:
+            text = _normalized_text(sentence.text)
+            lo = max(0, sentence.start_sample - window_start)
+            hi = min(audio.size, sentence.end_sample - window_start)
+            span_level = _rms(audio[lo:hi]) if hi > lo else 0.0
+            duration = (sentence.end_sample - sentence.start_sample) / SAMPLE_RATE
+            if (
+                text in _HALLUCINATION_FILLERS
+                and window_level > 0
+                and span_level < window_level * 0.45
+            ):
+                self.stats.dropped_hallucinations += 1
+                continue
+            if text and text == previous and duration < 3.0:
+                self.stats.dropped_hallucinations += 1
+                continue
+            kept.append(sentence)
+            previous = text
+        return kept
+
     async def _process(self, job: _Job) -> None:
         """Decode one job, commit its stable sentences, and publish the preview."""
         # Never decode audio that is already committed. A job can sit in the
@@ -415,16 +547,22 @@ class LiveSession:
             self.stats.dropped_stale += 1
             return
 
+        # A truncated preview is display-only: committing from it would skip the
+        # audio between the last commit and its start.
+        display_only = job.kind == "preview" and job.start_sample > self._committed
+
         started = time.monotonic()
         loop = asyncio.get_running_loop()
         from .asr import transcribe_array
 
+        decode_audio, _gain_db = _boost_for_decode(audio)
         transcript = await loop.run_in_executor(
             _DECODE_POOL,
-            lambda: transcribe_array(audio, streaming=True),
+            lambda: transcribe_array(decode_audio, streaming=True),
         )
         asr_ms = int((time.monotonic() - started) * 1000)
         self.stats.last_asr_ms = asr_ms
+        self._last_language = transcript.language or self._last_language
         if job.kind == "preview":
             self.stats.previews += 1
 
@@ -432,7 +570,11 @@ class LiveSession:
             sentence for sentence in self._sentences(job, window_start, transcript)
             if sentence.end_sample > self._committed  # a stale job may predate the last commit
         ]
-        stable, tail = self._split_committable(sentences, job)
+        sentences = self._drop_hallucinations(sentences, audio, window_start)
+        if display_only:
+            stable, tail = [], " ".join(sentence.text for sentence in sentences).strip()
+        else:
+            stable, tail = self._split_committable(sentences, job)
 
         for sentence in stable:
             await self._commit(sentence, asr_ms)
@@ -454,6 +596,7 @@ class LiveSession:
             "end": sentence.end_sample / SAMPLE_RATE,
             "duration": round((sentence.end_sample - sentence.start_sample) / SAMPLE_RATE, 2),
             "text": sentence.text,
+            "language": sentence.language or self._last_language,
             "asr_ms": asr_ms,
             "stats": self.stats.as_dict(),
         })
@@ -467,7 +610,8 @@ class LiveSession:
                 sentence.text,
                 asr_ms,
             )
-        await self._maybe_translate(segment_id, sentence.text, final=True)
+        self._last_committed_text = _normalized_text(sentence.text)
+        self._schedule_translation(segment_id, sentence.text, final=True)
 
     async def _commit_tail(self, sentences: list[_DecodedSentence], job: _Job) -> None:
         """Commit whatever remains in a flush that produced no usable segments."""
@@ -500,11 +644,27 @@ class LiveSession:
             "id": self._open_id,
             "start": self._committed / SAMPLE_RATE,
             "text": text,
+            "language": self._last_language,
             "asr_ms": asr_ms,
         })
-        await self._maybe_translate(self._open_id, text, final=False)
+        self._schedule_translation(self._open_id, text, final=False)
 
     # ── translation ──────────────────────────────────────────────────────────
+
+    def _schedule_translation(self, segment_id: int, text: str, *, final: bool) -> None:
+        """Run one translation off the decode worker.
+
+        The DeepSeek round-trip is a second of network; awaiting it inline stalls
+        the next decode by that much, which is exactly how a caption queue starts
+        growing. Order does not matter to the client: it merges translation
+        events into their row by id.
+        """
+        task = asyncio.create_task(
+            self._maybe_translate(segment_id, text, final=final),
+            name="dsh-voice-translate",
+        )
+        self._translate_tasks.add(task)
+        task.add_done_callback(self._translate_tasks.discard)
 
     async def _maybe_translate(self, segment_id: int, text: str, *, final: bool) -> None:
         """Translate a fragment when enabled, emitting a result event either way."""
