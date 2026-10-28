@@ -18,39 +18,43 @@ FULL=0
 
 fail() { echo; echo "FAILED: $1"; exit 1; }
 
-echo "== 1/10 meeting store (records, crash tolerance, ordering) =="
+echo "== 1/11 meeting store (records, crash tolerance, ordering) =="
 "$PY" tests/meetings_test.py || fail "meeting store"
 
 echo
-echo "== 2/10 Obsidian export (note shape, filenames, vault layout) =="
+echo "== 2/11 Obsidian export (note shape, filenames, vault layout) =="
 "$PY" tests/obsidian_export_test.py || fail "obsidian export"
 
 echo
-echo "== 3/10 decoding recipe + model selection =="
+echo "== 3/11 decoding recipe + model selection =="
 "$PY" tests/asr_config_test.py || fail "asr configuration"
 
 echo
-echo "== 4/10 model benchmark harness (WER math, noise mixing, report) =="
+echo "== 4/11 model benchmark harness (WER math, noise mixing, report) =="
 "$PY" tests/benchmark_test.py || fail "benchmark harness"
 
 echo
-echo "== 5/10 command line (every subcommand, offline) =="
+echo "== 5/11 command line (every subcommand, offline) =="
 "$PY" tests/cli_test.py || fail "command line"
 
 echo
-echo "== 6/11 HTTP surface (CORS for the panel, meeting list) =="
+echo "== 6/11 offline re-transcription (rebuild a record from the archived WAV) =="
+"$PY" tests/retranscribe_test.py || fail "re-transcription"
+
+echo
+echo "== 7/11 HTTP surface (CORS for the panel, meeting list) =="
 "$PY" tests/server_http_test.py || fail "HTTP surface"
 
 echo
-echo "== 7/11 browser bundle (render, slot registration, minutes renderer) =="
+echo "== 8/11 browser bundle (render, slot registration, minutes renderer) =="
 node tests/plugin_render_test.mjs || fail "browser bundle"
 
 echo
-echo "== 8/11 host half (supervisor behaviour) =="
+echo "== 9/11 host half (supervisor behaviour) =="
 node tests/plugin_host_test.mjs || fail "host half"
 
 echo
-echo "== 9/11 live session survives navigation (route changes must not stop a recording) =="
+echo "== 10/11 live session survives navigation (route changes must not stop a recording) =="
 node tests/plugin_session_test.mjs || fail "live session lifetime"
 
 if [[ $FULL -eq 0 ]]; then
@@ -60,12 +64,12 @@ if [[ $FULL -eq 0 ]]; then
 fi
 
 echo
-echo "== 10/11 live session + WebSocket service + meeting API =="
+echo "== --full: live session + WebSocket service + meeting API =="
 "$PY" tests/live_stream_test.py || fail "live session"
 "$PY" tests/server_ws_test.py || fail "websocket service"
 
 echo
-echo "== 11/11 recording -> transcript -> minutes =="
+echo "== --full: recording -> transcript -> minutes =="
 "$PY" tests/recording_pipeline_test.py || fail "recording pipeline"
 
 echo

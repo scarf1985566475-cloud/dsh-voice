@@ -10,6 +10,7 @@ granted to a shell).
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import logging
 import os
@@ -195,6 +196,8 @@ def _cmd_retranscribe(args: argparse.Namespace) -> int:
     """Re-transcribe a meeting from the audio its live session archived."""
     from .asr import transcribe_file
     from .meetings import AUDIO_FILENAME, MeetingError, MeetingStore, Segment
+    from .recordings import TRANSLATE_BATCH
+    from .translate import build_translator
 
     settings = load_settings()
     store = MeetingStore(settings.meetings_dir)
@@ -215,8 +218,18 @@ def _cmd_retranscribe(args: argparse.Namespace) -> int:
     print(f"re-transcribing {audio} ({audio.stat().st_size / (1024 * 1024):.1f} MB) ...", flush=True)
     started = time.monotonic()
     transcript = transcribe_file(audio, language=args.language)
+    texts = [segment.text for segment in transcript.segments]
+    translations: list[str] = ["" for _ in texts]
+    translator = None if args.no_translate else build_translator(settings)
+    if translator is not None and texts:
+        print(f"translating {len(texts)} segments ...", flush=True)
+        try:
+            results = asyncio.run(translator.translate_many_async(texts, batch_size=TRANSLATE_BATCH))
+            translations = [result.text for result in results]
+        finally:
+            asyncio.run(translator.aclose())
     segments = [
-        Segment(id=index, start=segment.start, end=segment.end, en=segment.text)
+        Segment(id=index, start=segment.start, end=segment.end, en=segment.text, zh=translations[index - 1])
         for index, segment in enumerate(transcript.segments, start=1)
         if segment.text.strip()
     ]
@@ -639,6 +652,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     retranscribe.add_argument("meeting_id")
     retranscribe.add_argument("--language", help="source language override (default: auto-detect)")
+    retranscribe.add_argument(
+        "--no-translate",
+        action="store_true",
+        help="keep the English transcript only (skips the DeepSeek translation leg)",
+    )
     retranscribe.set_defaults(func=_cmd_retranscribe)
 
     summarize = sub.add_parser("summarize", help="generate Chinese minutes for a recorded meeting")

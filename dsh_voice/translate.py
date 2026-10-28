@@ -51,6 +51,28 @@ class TranslationResult:
         return {"text": self.text, "ok": self.ok, **({"error": self.error} if self.error else {})}
 
 
+def build_translator(settings: Any) -> Translator | None:
+    """Create the translator a live session would use, or ``None`` when unavailable.
+
+    One place decides whether a translation leg exists at all, so live sessions,
+    file ingestion and re-transcription cannot drift apart.
+
+    Args:
+        settings: The interpreter settings.
+
+    Returns:
+        A ready translator, or ``None`` when translation is off or has no key.
+    """
+    if not settings.translation_available:
+        return None
+    return Translator(
+        api_base=settings.api_base,
+        api_model=settings.api_model,
+        api_key=settings.api_key,
+        target_language=settings.target_language,
+    )
+
+
 class Translator:
     """A reusable DeepSeek translation client with a small rolling context.
 

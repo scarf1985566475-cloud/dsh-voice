@@ -58,6 +58,7 @@ async def build_meeting_from_file(
         successful transcript).
     """
     from .asr import transcribe_file
+    from .translate import build_translator
 
     settings = settings or load_settings()
     store = store or MeetingStore(settings.meetings_dir)
@@ -90,12 +91,7 @@ async def build_meeting_from_file(
     translate_ms = 0
     translations_ok = True
     if translate and texts and settings.api_key:
-        translator = Translator(
-            api_base=settings.api_base,
-            api_model=settings.api_model,
-            api_key=settings.api_key,
-            target_language=settings.target_language,
-        )
+        translator = build_translator(settings)
         translate_started = time.monotonic()
         try:
             results = await translator.translate_many_async(texts, batch_size=TRANSLATE_BATCH)

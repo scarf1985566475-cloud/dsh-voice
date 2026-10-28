@@ -157,9 +157,13 @@ export DSH_VOICE_PYTHON=$HOME/.dsh-voice/venv/bin/python
 
 ```bash
 .venv-audio/bin/dsh-voice retranscribe 20261028-153000-000-abcd
+.venv-audio/bin/dsh-voice retranscribe 20261028-153000-000-abcd --no-translate   # 只要英文
 ```
 
-重转写会重写该会议的 `transcript.jsonl`（句子重新编号），并把旧的纪要标记为失效，之后可再 `summarize`。
+重转写和实时会话、`ingest` 走的是**同一个 Qwen3-ASR 模型**，只是喂的是整段离线的
+`audio.wav`（30s 分块、自动语言识别），所以一般比实时字幕更准；翻译这一支也会一并补回
+（DeepSeek 英译中，`--no-translate` 可跳过）。重转写会重写该会议的
+`transcript.jsonl`（句子重新编号），并把旧的纪要标记为失效，之后可再 `summarize`。
 文件录音（`ingest`）本来就有源文件，不会额外复制一份 WAV。
 
 `transcript.jsonl` 是**只追加**的，一条一句，不重写整个文件：
@@ -452,6 +456,7 @@ bash tests/run_all.sh --full   # 全链路（模型 + DeepSeek API，约 3 分�
 .venv-audio/bin/python tests/obsidian_export_test.py     # 笔记结构、文件名安全、重复导出
 .venv-audio/bin/python tests/asr_config_test.py          # 语言映射与模型选择（防旧模型回归）
 .venv-audio/bin/python tests/benchmark_test.py           # 基准测试自身：WER 算法、加噪、推荐规则
+.venv-audio/bin/python tests/retranscribe_test.py       # 用存档 audio.wav 重建记录（模型被 stub）
 .venv-audio/bin/python tests/server_http_test.py        # 面板跨域预检 + 会议列表（record 默认开）
 node tests/plugin_render_test.mjs                        # 面板渲染 + 纪要渲染器（含 XSS 安全）
 node tests/plugin_host_test.mjs                          # 守护逻辑：复用而不抢占
