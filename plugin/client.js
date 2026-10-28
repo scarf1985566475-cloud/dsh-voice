@@ -42,6 +42,7 @@ window.__ModuleLoader__.load({
     const PREFS_KEY = 'dsh-voice.preferences'
     const DEFAULT_PREFS = {
       translatePartials: true,
+      captions: true,
       viewMode: 'bilingual',
       fontSize: 'md',
       follow: true,
@@ -312,6 +313,11 @@ window.__ModuleLoader__.load({
   font: inherit; font-size: 12px; padding: 5px 12px; cursor: pointer; border-radius: 999px;
   border: 1px solid var(--dsw-alias-border-l2, #d0d7de); background: var(--dsw-alias-bg-layer-1, #fff);
   color: var(--dsw-alias-label-primary, #1f2328); box-shadow: 0 2px 10px rgba(0,0,0,.12); }
+.dsh-voice__captions-off { display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin: 0 16px 8px; padding: 7px 12px; border-radius: 8px; font-size: 12px;
+  border: 1px solid rgba(212,134,10,.35); background: rgba(255,196,0,.10);
+  color: var(--dsw-alias-label-primary, #1f2328); }
+.dsh-voice__captions-off-title { font-weight: 600; color: #8a5300; }
 .dsh-voice__footer { display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
   padding: 7px 16px 9px; font-size: 11px; color: var(--dsw-alias-label-tertiary, #6e7781);
   border-top: 1px solid var(--dsw-alias-border-l1, #eaecef); background: var(--dsw-alias-bg-layer-1, #fff); }
@@ -464,9 +470,13 @@ window.__ModuleLoader__.load({
        * Apply a runtime toggle on the service.
        * @param {boolean} translatePartials - Whether previews are translated too.
        */
-      configure(translatePartials) {
+      configure(translatePartials, captions) {
         if (this.socket && this.socket.readyState === WebSocket.OPEN) {
-          this.socket.send(JSON.stringify({ type: 'config', translate_partials: translatePartials }))
+          this.socket.send(JSON.stringify({
+            type: 'config',
+            translate_partials: translatePartials,
+            captions,
+          }))
         }
       }
 
@@ -618,6 +628,7 @@ window.__ModuleLoader__.load({
       notice: null,
       meeting: null,
       translatePartials: true,
+      captions: true,
       prefs: loadPrefs(),
       muted: false,
       startedAt: null,
@@ -626,6 +637,7 @@ window.__ModuleLoader__.load({
       snapshot: null,
     }
     voiceSession.translatePartials = voiceSession.prefs.translatePartials
+    voiceSession.captions = voiceSession.prefs.captions
 
     /** Build the immutable value subscribers read. */
     function sessionSnapshot() {
@@ -639,6 +651,7 @@ window.__ModuleLoader__.load({
         notice: voiceSession.notice,
         meeting: voiceSession.meeting,
         translatePartials: voiceSession.translatePartials,
+        captions: voiceSession.captions,
         prefs: voiceSession.prefs,
         muted: voiceSession.muted,
         startedAt: voiceSession.startedAt,
@@ -754,7 +767,7 @@ window.__ModuleLoader__.load({
       voiceSession.client = client
       try {
         await client.start()
-        client.configure(voiceSession.translatePartials)
+        client.configure(voiceSession.translatePartials, voiceSession.captions)
         voiceSession.state = 'live'
         voiceSession.startedAt = Date.now()
         sessionPublish()
@@ -882,7 +895,12 @@ window.__ModuleLoader__.load({
         savePrefs(voiceSession.prefs)
         if (patch.translatePartials !== undefined) {
           voiceSession.translatePartials = patch.translatePartials
-          if (voiceSession.client) voiceSession.client.configure(patch.translatePartials)
+        }
+        if (patch.captions !== undefined) {
+          voiceSession.captions = patch.captions
+        }
+        if (voiceSession.client && (patch.translatePartials !== undefined || patch.captions !== undefined)) {
+          voiceSession.client.configure(voiceSession.translatePartials, voiceSession.prefs.captions)
         }
         sessionPublish()
       }, [])
@@ -1105,6 +1123,11 @@ window.__ModuleLoader__.load({
             }), '自动跟随最新字幕'),
           React.createElement('label', { className: 'dsh-voice__check' },
             React.createElement('input', {
+              type: 'checkbox', checked: prefs.captions,
+              onChange: (event) => updatePrefs({ captions: event.target.checked }),
+            }), '实时字幕（关闭后仍录音存档）'),
+          React.createElement('label', { className: 'dsh-voice__check' },
+            React.createElement('input', {
               type: 'checkbox', checked: prefs.translatePartials,
               onChange: onPartialToggle,
             }), '预览（未定稿）也翻译')),
@@ -1227,6 +1250,17 @@ window.__ModuleLoader__.load({
               )
             }))
 
+      const captionsOff = state === 'live' && !prefs.captions
+        ? React.createElement('div', { className: 'dsh-voice__captions-off' },
+            React.createElement('span', { className: 'dsh-voice__captions-off-title' }, '实时字幕已关闭'),
+            React.createElement('span', null,
+              '麦克风音频仍在录音存档；停止后可在会议记录里重新转写这一场。'),
+            React.createElement('button', {
+              className: 'dsh-voice__btn dsh-voice__btn--tiny',
+              onClick: () => updatePrefs({ captions: true }),
+            }, '重新开启字幕'))
+        : null
+
       const banner = notice
         ? React.createElement('div', { className: 'dsh-voice__banner' },
             React.createElement('div', null, notice),
@@ -1281,6 +1315,7 @@ window.__ModuleLoader__.load({
       return React.createElement('div', { className: 'dsh-voice', 'data-font': prefs.fontSize },
         React.createElement('div', { className: 'dsh-voice__head' },
           header, settingsRow, searchRow, meta, titleRow),
+        captionsOff,
         banner,
         React.createElement('div', {
           className: 'dsh-voice__log', ref: logRef, onScroll,

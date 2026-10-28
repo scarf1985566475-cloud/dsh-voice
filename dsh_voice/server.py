@@ -402,7 +402,10 @@ async def _handle_control(
         return
     kind = message.get("type")
     if kind == "config":
-        session.configure(translate_partials=message.get("translate_partials"))
+        session.configure(
+            translate_partials=message.get("translate_partials"),
+            captions=message.get("captions"),
+        )
         await send({"type": "configured", "settings": session.settings.as_public_dict()})
     elif kind == "title":
         title = str(message.get("title") or "")

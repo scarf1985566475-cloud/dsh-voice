@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import dataclasses
 import shutil
 import sys
 import tempfile
@@ -145,11 +146,43 @@ def audit_record(meeting: object, events: list[dict], store_root: Path, meeting_
         problems.append("no transcript journal on disk")
     if not (store_root / meeting_id / "meta.json").is_file():
         problems.append("no metadata file on disk")
+    _audit_audio(store_root, meeting_id, problems)
     return problems
 
 
-async def run(audio: np.ndarray, settings: object, pace: float, store: MeetingStore) -> tuple[list[dict], str | None]:
+def _audit_audio(store_root: Path, meeting_id: str, problems: list[str]) -> None:
+    """Check that the session also archived the raw audio as a WAV file."""
+    import wave
+
+    audio_path = store_root / meeting_id / "audio.wav"
+    if not audio_path.is_file():
+        problems.append("no archived audio on disk")
+        return
+    try:
+        with wave.open(str(audio_path), "rb") as handle:
+            frames = handle.getnframes()
+            rate = handle.getframerate()
+            channels = handle.getnchannels()
+    except (wave.Error, EOFError):
+        problems.append("archived audio is not a readable WAV file")
+        return
+    if rate != SAMPLE_RATE or channels != 1:
+        problems.append(f"archived audio is {channels}ch {rate}Hz, expected 1ch {SAMPLE_RATE}Hz")
+    if frames <= 0:
+        problems.append("archived audio has no frames")
+
+
+async def run(
+    audio: np.ndarray,
+    settings: object,
+    pace: float,
+    store: MeetingStore,
+    *,
+    captions: bool = True,
+    title: str = "harness",
+) -> tuple[list[dict], str | None]:
     """Stream audio through a live session at a realistic pace, recording it."""
+    settings = dataclasses.replace(settings, captions=captions)
     events: list[dict] = []
 
     async def send(event: dict) -> None:
@@ -170,7 +203,7 @@ async def run(audio: np.ndarray, settings: object, pace: float, store: MeetingSt
         elif kind == "error":
             print(f"  ERROR           {event.get('message')}")
 
-    recorder = store.create(title="harness", language=settings.language, target_language="zh")
+    recorder = store.create(title=title, language=settings.language, target_language="zh")
     session = LiveSession(settings, send, recorder=recorder)
     await session.start()
     frame = SAMPLE_RATE // 10
@@ -243,6 +276,39 @@ def main() -> int:
             print(f"  finalized    {meeting.meta.ended_at is not None}")
             print(f"  transcript   {meeting.transcript_text()[:110]}")
             problems.extend(audit_record(meeting, events, store_root, meeting_id))
+
+        # Captions off: no decoding at all, but the audio and the meeting record
+        # must still be there, so the session can be re-transcribed afterwards.
+        quiet_audio = audio[: min(audio.size, 3 * SAMPLE_RATE)]
+        quiet_events, quiet_id = asyncio.run(
+            run(quiet_audio, settings, args.pace, store, captions=False, title="harness-quiet")
+        )
+        quiet_finals = [event for event in quiet_events if event.get("type") == "final"]
+        print("\ncaptions-off session")
+        print(f"  commits      {len(quiet_finals)}  (expected 0)")
+        if quiet_finals:
+            problems.append(f"captions-off session committed {len(quiet_finals)} segments")
+        ready = next((event for event in quiet_events if event.get("type") == "ready"), {})
+        if ready.get("settings", {}).get("captions") is not False:
+            problems.append("ready event does not report captions=false")
+        if quiet_id is None:
+            problems.append("captions-off session reported no meeting id")
+        else:
+            quiet_meeting = store.read(quiet_id)
+            if quiet_meeting.meta.segments != 0:
+                problems.append(f"captions-off meeting has {quiet_meeting.meta.segments} segments")
+            quiet_path = store_root / quiet_id / "audio.wav"
+            if not quiet_path.is_file():
+                problems.append("captions-off session archived no audio")
+            else:
+                import wave
+
+                with wave.open(str(quiet_path), "rb") as handle:
+                    seconds = handle.getnframes() / handle.getframerate()
+                expected = quiet_audio.size / SAMPLE_RATE
+                if abs(seconds - expected) > 1.0:
+                    problems.append(f"archived {seconds:.2f}s of audio, streamed {expected:.2f}s")
+                print(f"  archived     {seconds:.2f}s of audio  (streamed {expected:.2f}s)")
     finally:
         shutil.rmtree(store_root, ignore_errors=True)
 

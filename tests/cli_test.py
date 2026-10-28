@@ -156,8 +156,8 @@ def main() -> int:
 
         print("\nhelp surface")
         for command in ("serve", "transcribe", "translate", "record", "devices", "meetings",
-                        "show", "summarize", "ingest", "export", "doctor", "benchmark",
-                        "download-model", "selftest"):
+                        "show", "summarize", "retranscribe", "ingest", "export", "doctor",
+                        "benchmark", "download-model", "selftest"):
             code, out, _err = run_cli([command, "--help"])
             check(code == 0 and command in out, f"{command} --help is wired")
     finally:

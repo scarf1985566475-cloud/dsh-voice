@@ -37,6 +37,7 @@ KIND_TRANSLATION = "translation"
 
 META_FILENAME = "meta.json"
 JOURNAL_FILENAME = "transcript.jsonl"
+AUDIO_FILENAME = "audio.wav"
 SUMMARY_MD_FILENAME = "summary.md"
 SUMMARY_JSON_FILENAME = "summary.json"
 
@@ -430,6 +431,75 @@ class MeetingStore:
         except (OSError, ValueError) as error:
             raise MeetingError(f"meeting {meeting_id} is unreadable: {error}") from error
         return MeetingMeta.from_dict(payload)
+
+    def audio_path(self, meeting_id: str) -> Path:
+        """Path of the raw audio archived for this meeting, if any."""
+        return self.directory(meeting_id) / AUDIO_FILENAME
+
+    def replace_transcript(
+        self,
+        meeting_id: str,
+        segments: list[Segment],
+        *,
+        language: str | None = None,
+        model: str = "",
+    ) -> MeetingMeta:
+        """Replace a meeting's journal with a fresh offline transcription.
+
+        A live session archives ``audio.wav`` while streaming; if the user
+        recorded without captions, or wants a better transcript than the
+        streaming windows produced, this rewrites the journal from that file and
+        renumbers the segments from 1. The audio file is left untouched.
+
+        Args:
+            meeting_id: Meeting to rewrite.
+            segments: Sentences in stream order (Chinese may be empty).
+            language: Detected source language, when known.
+            model: ASR model identifier, when known.
+
+        Returns:
+            The updated metadata.
+        """
+        directory = self.directory(meeting_id)
+        meta = self.read_meta(meeting_id)
+        journal = directory / JOURNAL_FILENAME
+        temporary = journal.with_suffix(".jsonl.tmp")
+        written = 0
+        with temporary.open("w", encoding="utf-8") as handle:
+            for index, segment in enumerate(segments, start=1):
+                if not segment.en.strip():
+                    continue
+                written = index
+                handle.write(json.dumps({
+                    "kind": KIND_SEGMENT,
+                    "id": index,
+                    "start": round(segment.start, 3),
+                    "end": round(segment.end, 3),
+                    "en": segment.en,
+                    "asr_ms": segment.asr_ms,
+                    "at": segment.at or _utc_now(),
+                }, ensure_ascii=False) + "\n")
+                if segment.zh:
+                    handle.write(json.dumps({
+                        "kind": KIND_TRANSLATION,
+                        "id": index,
+                        "zh": segment.zh,
+                        "ms": segment.translate_ms,
+                    }, ensure_ascii=False) + "\n")
+        os.replace(temporary, journal)
+        meta.segments = written
+        meta.duration_s = round(max((segment.end for segment in segments), default=0.0), 3)
+        if language:
+            meta.language = language
+        if model:
+            meta.model = model
+        # Minutes generated from the streaming transcript are now stale.
+        meta.summary_status = "none"
+        meta.summary_at = None
+        (directory / META_FILENAME).write_text(
+            json.dumps(meta.as_dict(), ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        return meta
 
     def iter_records(self, meeting_id: str) -> Iterator[dict[str, Any]]:
         """Yield journal records in file order, ignoring malformed lines.

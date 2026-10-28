@@ -29,13 +29,15 @@ import concurrent.futures
 import contextlib
 import logging
 import time
+import wave
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
 import numpy as np
 
 from .config import SAMPLE_RATE, InterpreterSettings
-from .meetings import MeetingRecorder
+from .meetings import AUDIO_FILENAME, MeetingRecorder
 from .translate import Translator, is_sentence_end, push_context
 from .vad import Segment, StreamingSegmenter
 
@@ -188,6 +190,37 @@ class _DecodedSentence:
     language: str | None = None
 
 
+class _AudioArchive:
+    """Append-only 16-bit WAV holding the raw microphone audio of one meeting.
+
+    Written next to the journal so a live session can be re-transcribed offline
+    with the same 30-second decoding the file import uses. At 16 kHz mono that
+    costs about 115 MB per hour.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._handle = wave.open(str(path), "wb")
+        self._handle.setnchannels(1)
+        self._handle.setsampwidth(2)
+        self._handle.setframerate(SAMPLE_RATE)
+        self.closed = False
+
+    def write(self, samples: np.ndarray) -> None:
+        """Append mono float32 samples as clipped 16-bit PCM."""
+        if self.closed:
+            return
+        pcm = np.clip(samples, -1.0, 1.0) * 32767.0
+        self._handle.writeframes(pcm.astype(np.int16).tobytes())
+
+    def close(self) -> None:
+        """Finalize the WAV header; safe to call twice."""
+        if self.closed:
+            return
+        self.closed = True
+        self._handle.close()
+
+
 class LiveSession:
     """One client's live interpretation session.
 
@@ -213,6 +246,13 @@ class LiveSession:
         self.send = send
         self.stats = SessionStats()
         self.recorder = recorder
+        self._captions = settings.captions
+        self._audio: _AudioArchive | None = None
+        if recorder is not None:
+            try:
+                self._audio = _AudioArchive(recorder.directory / AUDIO_FILENAME)
+            except OSError:
+                LOGGER.warning("could not archive audio for meeting %s", recorder.meta.id)
         self._started_monotonic = time.monotonic()
         self.translator = translator if translator is not None else Translator(
             api_base=settings.api_base,
@@ -287,7 +327,7 @@ class LiveSession:
         self._tasks = []
 
         self._segmenter.flush()
-        if self._consumed > self._committed:
+        if self._captions and self._consumed > self._committed:
             await self._enqueue_flush(self._consumed)
         # Awaited rather than put_nowait: a full queue would otherwise drop the
         # sentinel and leave shutdown waiting out its whole timeout. The worker
@@ -317,6 +357,9 @@ class LiveSession:
             # Translations now run off the decode worker; let the last ones land
             # before the record is finalized and the HTTP client is closed.
             await asyncio.gather(*list(self._translate_tasks), return_exceptions=True)
+        if self._audio is not None:
+            with contextlib.suppress(OSError):
+                self._audio.close()
         if self.recorder is not None:
             # Finalized last, so the record's segment count and end time include
             # everything the drain just committed.
@@ -338,6 +381,12 @@ class LiveSession:
         """
         if self._closed or samples.size == 0:
             return
+        if self._audio is not None:
+            try:
+                self._audio.write(samples)
+            except OSError:
+                LOGGER.warning("audio archive write failed; continuing without it")
+                self._audio = None
         self._buffer = np.concatenate((self._buffer, np.ascontiguousarray(samples, dtype=np.float32)))
         self.stats.audio_seconds += samples.size / SAMPLE_RATE
 
@@ -346,7 +395,13 @@ class LiveSession:
             spans = self._segmenter.feed(self._buffer[index:])
             self._consumed = self._origin + self._buffer.size
             for span in spans:
-                await self._enqueue_flush(span.end_sample)
+                if self._captions:
+                    await self._enqueue_flush(span.end_sample)
+                else:
+                    # Captions are off: audio still streams into the archive,
+                    # and advancing the committed mark keeps timestamps honest
+                    # for when captions are switched back on.
+                    self._committed = max(self._committed, span.end_sample)
         self._trim()
 
     # ── queueing ─────────────────────────────────────────────────────────────
@@ -381,6 +436,8 @@ class LiveSession:
         while True:
             await asyncio.sleep(TICK_S)
             if self._closed:
+                continue
+            if not self._captions:
                 continue
             window = self._consumed - self._committed
             if window < self.settings.partial_interval_s * SAMPLE_RATE * 0.5:
@@ -732,14 +789,29 @@ class LiveSession:
 
     # ── client control ───────────────────────────────────────────────────────
 
-    def configure(self, *, translate_partials: bool | None = None) -> None:
+    def configure(
+        self,
+        *,
+        translate_partials: bool | None = None,
+        captions: bool | None = None,
+    ) -> None:
         """Apply a runtime toggle from the client.
 
         Args:
             translate_partials: Whether to translate still-open previews.
+            captions: Whether live captions are decoded. Turning them off keeps
+                recording audio into the meeting archive; turning them back on
+                resumes decoding from the current position.
         """
         if translate_partials is not None:
             self._translate_partials = translate_partials
+        if captions is not None and captions != self._captions:
+            self._captions = captions
+            if not captions:
+                # Do not decode audio that is already buffered: the point of the
+                # switch is to stop spending CPU now. The archive keeps the bytes.
+                self._committed = max(self._committed, self._consumed)
+                self._drop_previews()
 
     async def flush(self) -> None:
         """Commit the uncommitted window and wait until its captions are sent.

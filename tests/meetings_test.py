@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from dsh_voice.meetings import (  # noqa: E402
     JOURNAL_FILENAME,
+    Segment,
     MeetingError,
     MeetingStore,
     new_meeting_id,
@@ -147,6 +148,32 @@ def main() -> int:
             check(True, "deleting an unknown meeting raises")
         else:
             check(False, "deleting an unknown meeting raises")
+
+        print("\nreplace transcript")
+        quiet = store.create(title="录音重转写", source="live")
+        quiet_path = store.audio_path(quiet.meta.id)
+        quiet_path.write_bytes(b"RIFF....placeholder")
+        quiet.record_segment(1, 0.0, 2.0, "old text")
+        quiet.finalize(2.0)
+        replaced = store.replace_transcript(
+            quiet.meta.id,
+            [
+                Segment(id=9, start=0.5, end=4.0, en="new first.", asr_ms=100),
+                Segment(id=10, start=4.2, end=6.0, en="new second.", zh="新的第二句。"),
+            ],
+            language="en",
+            model="qwen3-test",
+        )
+        check(replaced.segments == 2, "replacement metadata counts the new segments")
+        check(replaced.duration_s == 6.0, "duration follows the new audio span")
+        check(replaced.model == "qwen3-test", "the replacement model is recorded")
+        readback = store.read(quiet.meta.id)
+        check([segment.en for segment in readback.segments] == ["new first.", "new second."],
+              "the journal is replaced by the new transcription")
+        check([segment.id for segment in readback.segments] == [1, 2], "segment ids are renumbered")
+        check(readback.segments[1].zh == "新的第二句。", "stored translations survive the rewrite")
+        check(quiet_path.is_file(), "re-transcription leaves the archived audio alone")
+        check(readback.meta.summary_status == "none", "a rewrite invalidates older minutes")
 
         print("\nsummary shaping")
         structured = normalize_structured({

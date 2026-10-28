@@ -191,6 +191,50 @@ def _cmd_devices(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_retranscribe(args: argparse.Namespace) -> int:
+    """Re-transcribe a meeting from the audio its live session archived."""
+    from .asr import transcribe_file
+    from .meetings import AUDIO_FILENAME, MeetingError, MeetingStore, Segment
+
+    settings = load_settings()
+    store = MeetingStore(settings.meetings_dir)
+    meeting_id = args.meeting_id
+    try:
+        audio = store.audio_path(meeting_id)
+        meta = store.read_meta(meeting_id)
+    except MeetingError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    if not audio.is_file():
+        print(
+            f"meeting {meeting_id} has no archived audio ({AUDIO_FILENAME}); "
+            "only live sessions recorded with recording enabled keep one",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"re-transcribing {audio} ({audio.stat().st_size / (1024 * 1024):.1f} MB) ...", flush=True)
+    started = time.monotonic()
+    transcript = transcribe_file(audio, language=args.language)
+    segments = [
+        Segment(id=index, start=segment.start, end=segment.end, en=segment.text)
+        for index, segment in enumerate(transcript.segments, start=1)
+        if segment.text.strip()
+    ]
+    meta = store.replace_transcript(
+        meeting_id,
+        segments,
+        language=transcript.language,
+        model=settings.model,
+    )
+    elapsed = time.monotonic() - started
+    print(
+        f"{len(segments)} segments in {elapsed:.1f}s; meeting {meta.id} "
+        f"now {meta.duration_s:.1f}s of audio (was {meta.segments} segments)"
+    )
+    print(f"next: dsh-voice summarize {meta.id}")
+    return 0
+
+
 def _cmd_meetings(args: argparse.Namespace) -> int:
     """List recorded meetings."""
     from .meetings import MeetingStore, meeting_summary_row
@@ -588,6 +632,14 @@ def build_parser() -> argparse.ArgumentParser:
     show.add_argument("--english-only", action="store_true", help="omit the Chinese lines")
     show.add_argument("--json", action="store_true", help="print the whole record as JSON")
     show.set_defaults(func=_cmd_show)
+
+    retranscribe = sub.add_parser(
+        "retranscribe",
+        help="re-transcribe a meeting from the audio its live session archived",
+    )
+    retranscribe.add_argument("meeting_id")
+    retranscribe.add_argument("--language", help="source language override (default: auto-detect)")
+    retranscribe.set_defaults(func=_cmd_retranscribe)
 
     summarize = sub.add_parser("summarize", help="generate Chinese minutes for a recorded meeting")
     summarize.add_argument("meeting_id")

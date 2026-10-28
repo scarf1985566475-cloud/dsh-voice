@@ -69,7 +69,7 @@ export DSH_VOICE_PYTHON=$HOME/.dsh-voice/venv/bin/python
 | 区域 | 内容 |
 |---|---|
 | 顶部状态条 | 监听状态（含「未检测到声音」提示）、会话计时、麦克风电平、模型/翻译/记录三个状态丸 |
-| 设置行 | 显示模式（中 / 中+英 / 英）、字号（小/中/大）、自动跟随、预览也翻译、导出 Markdown / SRT |
+| 设置行 | 实时字幕开关（关闭后只录音不识别）、显示模式（中 / 中+英 / 英）、字号（小/中/大）、自动跟随、预览也翻译、导出 Markdown / SRT |
 | 搜索行 | 按 `/` 打开，过滤并高亮英中双语（Esc 关闭） |
 | 字幕行 | 左侧 `mm:ss` 时间、识别语言 badge、`识别中`/`翻译中` 状态、最终/实时耗时；未定稿行用虚线左边框 + 闪烁光标标识 |
 | 底部 | 隐私说明、段数、时长、翻译失败数、查看会议记录；`↓ 回到最新` 悬浮按钮 |
@@ -96,6 +96,7 @@ export DSH_VOICE_PYTHON=$HOME/.dsh-voice/venv/bin/python
                     │  VAD 分段 → 滚动窗口 → Qwen3-ASR 识别          │
                     │  → 稳定句子提交 → DeepSeek 英译中              │
                     │  → 追加写入会议日志（JSONL，崩溃安全）          │
+                    │  → 同时存档原始音频（16kHz WAV，可离线重转写）  │
                     │  → 纪要：结构化 JSON → 本地渲染 Markdown       │
                     └───────────────┬──────────────────────────────┘
                                     │ 落盘
@@ -103,6 +104,7 @@ export DSH_VOICE_PYTHON=$HOME/.dsh-voice/venv/bin/python
                     │ meetings/<id>/                               │
                     │   meta.json          标题/时长/段数/纪要状态   │
                     │   transcript.jsonl   逐句追加日志（不重写）     │
+                    │   audio.wav          实时会话的原始录音（可选） │
                     │   summary.md / .json 会议纪要                 │
                     └──────────────────────────────────────────────┘
                                     ▲
@@ -149,6 +151,16 @@ export DSH_VOICE_PYTHON=$HOME/.dsh-voice/venv/bin/python
 
 开始收听就创建一次会议记录；每次提交一句英文就**立刻落盘**，译文到达后再追加一条。
 所以哪怕进程被 `kill -9`，已经听到的内容依然能读回来。
+
+实时会话默认还会把麦克风音频原样存成 `meetings/<id>/audio.wav`（16kHz 单声道，约 115MB/小时），
+即使关掉「实时字幕」也会继续录音；停止后可以拿这份音频离线高质量重转写：
+
+```bash
+.venv-audio/bin/dsh-voice retranscribe 20261028-153000-000-abcd
+```
+
+重转写会重写该会议的 `transcript.jsonl`（句子重新编号），并把旧的纪要标记为失效，之后可再 `summarize`。
+文件录音（`ingest`）本来就有源文件，不会额外复制一份 WAV。
 
 `transcript.jsonl` 是**只追加**的，一条一句，不重写整个文件：
 
@@ -379,6 +391,7 @@ Vault 解析顺序：`--vault` → `DSH_VOICE_OBSIDIAN_VAULT` → Obsidian 注�
 | `END_SILENCE_MS` | `700` | 多长静音判为一句结束 |
 | `MAX_SEGMENT` | `20` | 单段硬上限（秒） |
 | `RECORD` | `true` | 实时会话是否写入会议记录；纯字幕可加 `serve --no-record` |
+| `CAPTIONS` | `true` | 实时字幕解码开关，关掉后只录音不跑 ASR/翻译；面板设置里也能随时切 |
 | `MEETINGS_DIR` | `meetings/` | 会议记录根目录 |
 | `API_BASE` / `API_MODEL` | `https://api.deepseek.com` / `deepseek-chat` | 翻译与纪要后端 |
 | `OBSIDIAN_VAULT` | 注册表里最后打开的 vault | Obsidian vault 目录 |
@@ -403,6 +416,7 @@ dsh-voice devices                              # 设备列表
 
 dsh-voice meetings [--limit N] [--text]        # 会议列表
 dsh-voice show ID [--summary|--english-only|--json]  # 看全文或纪要
+dsh-voice retranscribe ID [--language]         # 用存档 audio.wav 重新转写
 dsh-voice summarize ID [--force]               # 生成纪要
 dsh-voice ingest FILE [--title T] [--text]     # 录音文件 → 记录 + 纪要
 dsh-voice export ID [--vault V] [--folder F]   # 导出到 Obsidian

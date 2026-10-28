@@ -265,6 +265,8 @@ class InterpreterSettings:
         max_segment_s: Hard cap on a segment before it is force-closed.
         min_segment_s: Segments shorter than this are dropped as noise.
         record: Whether live sessions are written to the meeting store.
+        captions: Whether live captions are decoded (the archive records audio
+            regardless, so captions can be toggled off to save CPU).
         meetings_dir: Root directory of the meeting store.
         api_base: DeepSeek-compatible API base URL.
         api_model: Chat model used for translation.
@@ -286,6 +288,7 @@ class InterpreterSettings:
     max_segment_s: float
     min_segment_s: float
     record: bool
+    captions: bool
     meetings_dir: str
     api_base: str
     api_model: str
@@ -312,6 +315,7 @@ class InterpreterSettings:
             "translate_partials": self.translate_partials,
             "translation_available": self.translation_available,
             "record": self.record,
+            "captions": self.captions,
             "api_model": self.api_model,
         }
 
@@ -372,6 +376,10 @@ def load_settings(**overrides: object) -> InterpreterSettings:
         # 会议纪要仍可由整场录音离线转写或对话中重新生成。要纯字幕不上记录，
         # 启动服务时加 --no-record（或设 DSH_VOICE_RECORD=0）。
         "record": _env_bool("RECORD", True),
+        # Live captions can be turned off from the panel while the session keeps
+        # archiving audio; re-transcribe that audio afterwards with
+        # ``dsh-voice retranscribe <id>``.
+        "captions": _env_bool("CAPTIONS", True),
         "meetings_dir": _env("MEETINGS_DIR", str(DEFAULT_MEETINGS_DIR)),
         "api_base": _env("API_BASE", DEEPSEEK_BASE_URL),
         "api_model": _env("API_MODEL", DEEPSEEK_MODEL),
