@@ -1,10 +1,17 @@
-"""Local speech recognition on MLX Whisper (Apple Silicon, fully offline).
+"""Local speech recognition on Qwen3-ASR (Apple Silicon, fully offline).
 
 The model is loaded from a local directory so steady-state operation never
 touches the network: :func:`ensure_model` performs the one-time snapshot, and
-every later call addresses the directory directly. ``mlx_whisper`` already
-caches the loaded weights per path (``ModelHolder``), so a long interpretation
-session pays the load cost once.
+every later call addresses the directory directly. Weights are cached per path
+for the life of the process, so a long interpretation session pays the load
+cost once.
+
+Why Qwen3-ASR rather than Whisper: on our own recordings the Whisper family
+answered near-silence with stock phrases ("Thank you.", "Loss.") and entered
+repetition loops; Qwen3-ASR is trained against exactly that failure, detects
+the spoken language per chunk (a lecture with Chinese side-talk no longer gets
+translated as English), and covers 30 languages plus 22 Chinese dialects —
+which is the accent problem this project exists for.
 """
 
 from __future__ import annotations
@@ -25,15 +32,91 @@ LOGGER = logging.getLogger("dsh_voice.asr")
 #: huggingface.co is unreachable from some networks while this mirror is not.
 DEFAULT_HF_ENDPOINT = "https://hf-mirror.com"
 
-#: Serializes every decode: MLX runs on one GPU stream and the holder caches one model.
+#: Serializes every decode: MLX runs on one GPU stream and the cache holds one model.
 _DECODE_LOCK = threading.Lock()
 
 _model_lock = threading.Lock()
 _model_ready = False
 
+#: Model instances keyed by resolved directory, so one process loads each once.
+_MODEL_CACHE: dict[str, Any] = {}
+
+#: Audio is decoded in these slices. Qwen3-ASR has no token-level timestamps,
+#: so the slice length *is* the timestamp granularity a meeting record gets;
+#: 30 s keeps citations useful without cutting too many words at a boundary.
+CHUNK_DURATION_S = 30.0
+
+#: Very short live windows are padded to this length by the model's chunker.
+#: Keeping it small means a 0.6 s span is not decoded with 1.4 s of silence.
+MIN_CHUNK_DURATION_S = 0.3
+
+#: Language codes and spellings people actually pass in, mapped to the names
+#: Qwen3-ASR's prompt expects. Anything unknown falls back to auto-detection.
+_LANGUAGE_ALIASES: dict[str, str] = {
+    "en": "English", "eng": "English", "english": "English",
+    "zh": "Chinese", "zho": "Chinese", "cmn": "Chinese", "chinese": "Chinese",
+    "mandarin": "Chinese", "zh-cn": "Chinese", "zh-hans": "Chinese", "zh-tw": "Chinese",
+    "yue": "Cantonese", "cantonese": "Cantonese", "zh-hk": "Cantonese",
+    "ja": "Japanese", "jp": "Japanese", "japanese": "Japanese",
+    "ko": "Korean", "kr": "Korean", "korean": "Korean",
+    "fr": "French", "fra": "French", "fre": "French", "french": "French",
+    "de": "German", "deu": "German", "ger": "German", "german": "German",
+    "es": "Spanish", "spa": "Spanish", "spanish": "Spanish",
+    "pt": "Portuguese", "por": "Portuguese", "portuguese": "Portuguese",
+    "it": "Italian", "ita": "Italian", "italian": "Italian",
+    "ru": "Russian", "rus": "Russian", "russian": "Russian",
+    "ar": "Arabic", "ara": "Arabic", "arabic": "Arabic",
+    "th": "Thai", "tha": "Thai", "thai": "Thai",
+    "vi": "Vietnamese", "vie": "Vietnamese", "vietnamese": "Vietnamese",
+    "id": "Indonesian", "ind": "Indonesian", "indonesian": "Indonesian",
+    "tr": "Turkish", "tur": "Turkish", "turkish": "Turkish",
+    "hi": "Hindi", "hin": "Hindi", "hindi": "Hindi",
+    "nl": "Dutch", "nld": "Dutch", "dut": "Dutch", "dutch": "Dutch",
+    "sv": "Swedish", "swe": "Swedish", "swedish": "Swedish",
+    "da": "Danish", "dan": "Danish", "danish": "Danish",
+    "fi": "Finnish", "fin": "Finnish", "finnish": "Finnish",
+    "no": "Norwegian", "nor": "Norwegian", "norwegian": "Norwegian",
+    "pl": "Polish", "pol": "Polish", "polish": "Polish",
+    "cs": "Czech", "ces": "Czech", "cze": "Czech", "czech": "Czech",
+    "el": "Greek", "ell": "Greek", "gre": "Greek", "greek": "Greek",
+    "hu": "Hungarian", "hun": "Hungarian", "hungarian": "Hungarian",
+    "ro": "Romanian", "ron": "Romanian", "rum": "Romanian", "romanian": "Romanian",
+    "sk": "Slovak", "slk": "Slovak", "slo": "Slovak", "slovak": "Slovak",
+    "uk": "Ukrainian", "ukr": "Ukrainian", "ukrainian": "Ukrainian",
+    "fa": "Persian", "fas": "Persian", "per": "Persian", "persian": "Persian",
+    "ur": "Urdu", "urd": "Urdu", "urdu": "Urdu",
+    "ms": "Malay", "msa": "Malay", "may": "Malay", "malay": "Malay",
+    "he": "Hebrew", "heb": "Hebrew", "hebrew": "Hebrew",
+    "bn": "Bengali", "ben": "Bengali", "bengali": "Bengali",
+    "ta": "Tamil", "tam": "Tamil", "tamil": "Tamil",
+    "te": "Telugu", "tel": "Telugu", "telugu": "Telugu",
+    "mr": "Marathi", "mar": "Marathi", "marathi": "Marathi",
+    "gu": "Gujarati", "guj": "Gujarati", "gujarati": "Gujarati",
+    "kn": "Kannada", "kan": "Kannada", "kannada": "Kannada",
+    "ml": "Malayalam", "mal": "Malayalam", "malayalam": "Malayalam",
+    "pa": "Punjabi", "pan": "Punjabi", "punjabi": "Punjabi",
+    "sw": "Swahili", "swa": "Swahili", "swahili": "Swahili",
+    "fil": "Filipino", "tl": "Filipino", "filipino": "Filipino",
+}
+
+#: Canonical name back to a two-letter code for the wire.
+_LANGUAGE_CODES: dict[str, str] = {
+    "Chinese": "zh", "English": "en", "Cantonese": "yue", "Japanese": "ja",
+    "Korean": "ko", "French": "fr", "German": "de", "Spanish": "es",
+    "Portuguese": "pt", "Italian": "it", "Russian": "ru", "Arabic": "ar",
+    "Thai": "th", "Vietnamese": "vi", "Indonesian": "id", "Turkish": "tr",
+    "Hindi": "hi", "Dutch": "nl", "Swedish": "sv", "Danish": "da",
+    "Finnish": "fi", "Norwegian": "no", "Polish": "pl", "Czech": "cs",
+    "Greek": "el", "Hungarian": "hu", "Romanian": "ro", "Slovak": "sk",
+    "Ukrainian": "uk", "Persian": "fa", "Urdu": "ur", "Malay": "ms",
+    "Hebrew": "he", "Bengali": "bn", "Tamil": "ta", "Telugu": "te",
+    "Marathi": "mr", "Gujarati": "gu", "Kannada": "kn", "Malayalam": "ml",
+    "Punjabi": "pa", "Swahili": "sw", "Filipino": "fil",
+}
+
 
 class ModelUnavailableError(RuntimeError):
-    """Raised when the Whisper weights are neither present locally nor downloadable."""
+    """Raised when the Qwen3-ASR weights are neither present locally nor downloadable."""
 
 
 @dataclass
@@ -86,16 +169,19 @@ def model_path() -> Path:
     return Path(load_settings().model).expanduser()
 
 
-def model_present() -> bool:
-    """Whether the configured model directory already holds weights."""
-    directory = model_path()
-    if not directory.is_dir():
+def model_present(directory: str | Path | None = None) -> bool:
+    """Whether a model directory already holds weights."""
+    target = Path(directory).expanduser() if directory is not None else model_path()
+    if not target.is_dir():
         return False
-    return (directory / "weights.safetensors").exists() or (directory / "weights.npz").exists()
+    for pattern in ("*.safetensors", "*.npz"):
+        if any(target.glob(pattern)):
+            return True
+    return False
 
 
 def ensure_model(repo: str | None = None, destination: str | Path | None = None) -> Path:
-    """Materialize the Whisper weights locally, downloading them only when absent.
+    """Materialize the Qwen3-ASR weights locally, downloading them only when absent.
 
     Args:
         repo: Hugging Face repo id; defaults to the configured repo.
@@ -109,16 +195,14 @@ def ensure_model(repo: str | None = None, destination: str | Path | None = None)
     """
     settings = load_settings()
     target = Path(destination).expanduser() if destination is not None else model_path()
-    if model_present() and destination is None:
-        return target
-    if (target / "weights.safetensors").exists() or (target / "weights.npz").exists():
+    if model_present(target):
         return target
     endpoint = configure_hf_endpoint()
     LOGGER.info("downloading %s into %s via %s", repo or settings.model_repo, target, endpoint)
     try:
         from huggingface_hub import snapshot_download
     except ImportError as error:  # pragma: no cover - dependency is declared
-        raise ModelUnavailableError("huggingface_hub is required to fetch the Whisper weights") from error
+        raise ModelUnavailableError("huggingface_hub is required to fetch the model weights") from error
     try:
         # Keep the hub cache inside the project so a sandboxed process never
         # needs write access to the user's home cache directory.
@@ -129,11 +213,42 @@ def ensure_model(repo: str | None = None, destination: str | Path | None = None)
             f"could not fetch {repo or settings.model_repo}: {error}. "
             f"Set DSH_VOICE_HF_ENDPOINT to a reachable mirror, or place the weights in {target}.",
         ) from error
+    if not model_present(target):
+        raise ModelUnavailableError(f"the snapshot in {target} contains no weights")
     return target
 
 
+def _load_model(directory: Path) -> Any:
+    """Load (and cache) the Qwen3-ASR model for one directory.
+
+    Args:
+        directory: Model directory holding ``config.json`` and the weights.
+
+    Returns:
+        The loaded model, ready for ``generate``.
+
+    Raises:
+        ModelUnavailableError: When the weights cannot be loaded.
+    """
+    key = str(directory)
+    with _model_lock:
+        cached = _MODEL_CACHE.get(key)
+        if cached is not None:
+            return cached
+        try:
+            from mlx_audio.stt.utils import load_model
+        except ImportError as error:  # pragma: no cover - dependency is declared
+            raise ModelUnavailableError("mlx-audio is required to load Qwen3-ASR") from error
+        try:
+            model = load_model(key)
+        except Exception as error:  # noqa: BLE001 - surface one typed error
+            raise ModelUnavailableError(f"could not load {key}: {error}") from error
+        _MODEL_CACHE[key] = model
+        return model
+
+
 def warmup() -> str:
-    """Load the weights once so the first live segment is not the slow one.
+    """Load the weights and compile one decode so the first live span is not the slow one.
 
     Returns:
         The resolved model directory.
@@ -143,53 +258,78 @@ def warmup() -> str:
     """
     global _model_ready  # noqa: PLW0603 - one process-wide latch
     directory = ensure_model()
+    model = _load_model(directory)
     with _model_lock:
         if not _model_ready:
-            import mlx_whisper
-
-            silence = np.zeros(SAMPLE_RATE // 2, dtype=np.float32)
-            mlx_whisper.transcribe(silence, path_or_hf_repo=str(directory), verbose=None, language="en")
+            with _DECODE_LOCK:
+                silence = np.zeros(int(0.6 * SAMPLE_RATE), dtype=np.float32)
+                model.generate(silence, language=None, chunk_duration=CHUNK_DURATION_S,
+                               min_chunk_duration=MIN_CHUNK_DURATION_S, verbose=False)
             _model_ready = True
     return str(directory)
 
 
+def _qwen_language(language: str | None) -> str | None:
+    """Map a language code or name onto Qwen3-ASR's prompt vocabulary.
+
+    Args:
+        language: Two-letter code, full name, or ``None`` for auto-detection.
+
+    Returns:
+        The canonical name the model expects, or ``None`` to auto-detect. An
+        unknown value is logged and treated as auto-detection rather than
+        passed through, because a name the model does not know produces a
+        prompt it was not trained on.
+    """
+    if language is None:
+        return None
+    cleaned = str(language).strip()
+    if not cleaned:
+        return None
+    mapped = _LANGUAGE_ALIASES.get(cleaned.lower())
+    if mapped is None:
+        LOGGER.warning("unknown language %r; falling back to auto-detect", cleaned)
+    return mapped
+
+
+def _language_code(name: str | None) -> str | None:
+    """Map a detected language name back to a two-letter code for the wire."""
+    if not name:
+        return None
+    return _LANGUAGE_CODES.get(name, str(name).lower())
+
+
 def _decode_options(language: str | None, *, streaming: bool, initial_prompt: str | None) -> dict[str, Any]:
-    """Build the decoding options shared by the file and live paths.
+    """Build the generation options shared by the file and live paths.
 
-    Two settings here are load-bearing, both chosen from measurement on a hard,
-    domain-specific sample (an academic lecture) rather than from the defaults:
+    Qwen3-ASR has no temperature fallback ladder — its repetition guard is the
+    training itself, and it is deterministically greedy by default. What does
+    matter here:
 
-    * ``temperature`` keeps Whisper's fallback ladder. Pinning it to ``0.0``
-      looks harmless and is a common recipe, but it *removes the retry* that the
-      compression-ratio and log-probability guards trigger — and a recognizer
-      stuck in a repetition loop is exactly what those guards catch. Measured on
-      the sample: 72.6% WER pinned versus 4.7% with the ladder.
-    * ``condition_on_previous_text`` is off for **both** paths. Feeding a window
-      its own previous output is what starts a runaway repetition on hard
-      content; measured 0.9% off versus 4.7% on, with the failure mode being
-      hundreds of hallucinated words rather than a small accuracy difference.
+    * ``language`` is either a canonical name or ``None``; auto-detection is
+      what lets a bilingual lecture keep its Chinese side-talk in Chinese.
+    * ``chunk_duration`` fixes the timestamp granularity of a long file.
+    * ``system_prompt`` is the model's vocabulary-bias channel, so a CLI
+      ``--prompt`` still works the way it did with Whisper's ``initial_prompt``.
 
     Args:
         language: Source language, or ``None`` to auto-detect.
-        streaming: Live mode; currently affects nothing beyond intent, since
-            cross-window prompting is off everywhere.
+        streaming: Live mode; windows there are shorter than one chunk, so this
+            changes nothing today but keeps the two call sites symmetric.
         initial_prompt: Optional domain vocabulary hint.
 
     Returns:
-        Keyword arguments for ``mlx_whisper.transcribe``.
+        Keyword arguments for ``model.generate``.
     """
+    del streaming  # a live window is always one chunk
     options: dict[str, Any] = {
-        "temperature": (0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
-        "condition_on_previous_text": False,
-        "compression_ratio_threshold": 2.4,
-        "logprob_threshold": -1.0,
-        "no_speech_threshold": 0.6,
-        "verbose": None,
+        "language": _qwen_language(language),
+        "chunk_duration": CHUNK_DURATION_S,
+        "min_chunk_duration": MIN_CHUNK_DURATION_S,
+        "verbose": False,
     }
-    if language:
-        options["language"] = language
     if initial_prompt:
-        options["initial_prompt"] = initial_prompt
+        options["system_prompt"] = initial_prompt
     return options
 
 
@@ -199,28 +339,35 @@ def _run(audio: np.ndarray, *, streaming: bool, language: str | None, initial_pr
         return Transcript(text="")
     settings = load_settings()
     directory = ensure_model()
-    import mlx_whisper
+    model = _load_model(directory)
 
     options = _decode_options(language, streaming=streaming, initial_prompt=initial_prompt)
     with _DECODE_LOCK:
-        result = mlx_whisper.transcribe(
-            np.ascontiguousarray(audio, dtype=np.float32),
-            path_or_hf_repo=str(directory),
-            **options,
-        )
+        output = model.generate(np.ascontiguousarray(audio, dtype=np.float32), **options)
+
+    detected: list[str] = []
+    raw_language = getattr(output, "language", None)
+    if isinstance(raw_language, (list, tuple)):
+        detected = [str(item) for item in raw_language if item]
+    elif raw_language:
+        detected = [str(raw_language)]
+
     segments = [
         TranscriptSegment(
             start=float(segment.get("start", 0.0)),
             end=float(segment.get("end", 0.0)),
             text=str(segment.get("text", "")).strip(),
         )
-        for segment in result.get("segments", [])
+        for segment in getattr(output, "segments", None) or []
     ]
+    duration = audio.size / SAMPLE_RATE
+    if not segments and str(output.text).strip():
+        segments = [TranscriptSegment(start=0.0, end=duration, text=str(output.text).strip())]
     return Transcript(
-        text=str(result.get("text", "")).strip(),
-        language=result.get("language") or settings.language,
+        text=str(output.text).strip(),
+        language=_language_code(detected[0] if detected else None) or settings.language,
         segments=[segment for segment in segments if segment.text],
-        duration=audio.size / SAMPLE_RATE,
+        duration=duration,
     )
 
 

@@ -80,7 +80,7 @@ STATE = ServiceState()
 
 
 def _warmup() -> None:
-    """Load the Whisper weights once, off the event loop."""
+    """Load the Qwen3-ASR weights once, off the event loop."""
     from .asr import ModelUnavailableError, warmup
 
     STATE.warmup_state = "loading"
@@ -96,7 +96,7 @@ def _warmup() -> None:
         LOGGER.exception("model warmup failed")
     else:
         STATE.warmup_state = "ready"
-        LOGGER.info("whisper model ready at %s", STATE.settings.model)
+        LOGGER.info("Qwen3-ASR model ready at %s", STATE.settings.model)
 
 
 def create_app() -> FastAPI:

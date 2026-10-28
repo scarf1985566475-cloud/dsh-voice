@@ -102,23 +102,23 @@ def main() -> int:
 
     print("\nreport shape")
     result = ModelResult(
-        model="/tmp/model", label="whisper-test", load_s=1.234, rtf=0.25,
+        model="/tmp/model", label="qwen3-test", load_s=1.234, rtf=0.25,
         slice_ms=321.0, slice_p90_ms=400.0, peak_mb=1500.0, rss_mb=3000.0,
         wer_clean=0.0, wer_noisy=0.1, size_mb=1500.0,
         extra={"slices": {"6s": {"median_ms": 321.0, "p90_ms": 400.0}, "20s": {"median_ms": 900.0, "p90_ms": 950.0}}},
     )
     payload = {
         "reference": "x", "snr_db": 10.0, "slice_lengths": [6.0, 20.0],
-        "results": [result.as_dict()], "ranking": ["whisper-test"],
-        "fastest": "whisper-test", "most_accurate_noisy": "whisper-test",
-        "recommendation": "keep whisper-test",
+        "results": [result.as_dict()], "ranking": ["qwen3-test"],
+        "fastest": "qwen3-test", "most_accurate_noisy": "qwen3-test",
+        "recommendation": "keep qwen3-test",
     }
     table = format_table(payload)
-    check("whisper-test" in table, "table names the model")
+    check("qwen3-test" in table, "table names the model")
     check("321ms" in table, "table reports the 6s slice latency")
     check("900ms" in table, "table reports the 20s slice latency")
     check("10.0%" in table, "table reports noisy WER as a percentage")
-    check("keep whisper-test" in table, "table surfaces the recommendation")
+    check("keep qwen3-test" in table, "table surfaces the recommendation")
     failed = ModelResult(model="/tmp/bad", label="broken", ok=False, error="Boom")
     broken_payload = dict(payload, results=[failed.as_dict()])
     check("Boom" in format_table(broken_payload), "a failed model still renders, with its reason")
@@ -128,14 +128,14 @@ def main() -> int:
         return ModelResult(model=label, label=label, ok=ok, slice_ms=slice_ms, wer_noisy=wer_noisy).as_dict()
 
     base = {"reference": "x", "snr_db": 10.0, "slice_lengths": [6.0], "ranking": []}
-    incumbent_only = dict(base, results=[row("whisper-large-v3-turbo", 1600.0, 0.01)])
+    incumbent_only = dict(base, results=[row("qwen3-asr-0.6b-4bit", 1600.0, 0.01)])
     check("keep" in recommend(incumbent_only), "keeps the incumbent when it is the only option")
-    clearly_better = dict(base, results=[row("whisper-large-v3-turbo", 1600.0, 0.01), row("small", 500.0, 0.01)])
-    check("switch to small" in recommend(clearly_better), "switches when a challenger is far faster and as accurate")
-    no_speed_gain = dict(base, results=[row("whisper-large-v3-turbo", 1600.0, 0.01), row("distil", 1500.0, 0.01)])
-    check("keep whisper-large-v3-turbo" in recommend(no_speed_gain), "keeps the incumbent when the speed gain is marginal")
-    less_accurate = dict(base, results=[row("whisper-large-v3-turbo", 1600.0, 0.01), row("small", 500.0, 0.05)])
-    check("keep whisper-large-v3-turbo" in recommend(less_accurate), "keeps the incumbent when the challenger loses accuracy")
+    clearly_better = dict(base, results=[row("qwen3-asr-0.6b-4bit", 1600.0, 0.01), row("qwen3-8bit", 500.0, 0.01)])
+    check("switch to qwen3-8bit" in recommend(clearly_better), "switches when a challenger is far faster and as accurate")
+    no_speed_gain = dict(base, results=[row("qwen3-asr-0.6b-4bit", 1600.0, 0.01), row("qwen3-8bit", 1500.0, 0.01)])
+    check("keep qwen3-asr-0.6b-4bit" in recommend(no_speed_gain), "keeps the incumbent when the speed gain is marginal")
+    less_accurate = dict(base, results=[row("qwen3-asr-0.6b-4bit", 1600.0, 0.01), row("qwen3-8bit", 500.0, 0.05)])
+    check("keep qwen3-asr-0.6b-4bit" in recommend(less_accurate), "keeps the incumbent when the challenger loses accuracy")
     none_loaded = dict(base, results=[row("broken", 0.0, 0.0, ok=False)])
     check("nothing to recommend" in recommend(none_loaded), "says so when no model loaded")
 

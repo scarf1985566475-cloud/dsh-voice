@@ -215,7 +215,7 @@ def render_note(
         "> [!info] 会议信息",
         f"> 时间：{meta.started_at[:16].replace('T', ' ')} · 时长 {_format_duration(duration)} · "
         f"{meta.segments} 段 · 来源：{origin}",
-        f"> 由 dsh-voice 本地识别（MLX Whisper）＋ DeepSeek 翻译/纪要保持同步",
+        f"> 由 dsh-voice 本地识别（Qwen3-ASR）＋ DeepSeek 翻译/纪要保持同步",
         "",
     ]
 

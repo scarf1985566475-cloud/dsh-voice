@@ -1,10 +1,10 @@
 [project]
 name = "dsh-voice"
-version = "0.1.0"
+version = "0.2.0"
 description = "Local speech transcription and English-to-Chinese simultaneous interpretation for DeepSeek Harness"
 requires-python = ">=3.10"
 dependencies = [
-    "mlx-whisper>=0.4.3",
+    "mlx-audio>=0.6.2,<0.7",
     "numpy>=1.26",
     "fastapi>=0.110",
     "uvicorn[standard]>=0.27",

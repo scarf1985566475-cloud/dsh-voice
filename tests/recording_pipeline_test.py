@@ -1,7 +1,7 @@
 """End-to-end check of the "record and summarize a meeting" objective.
 
 Synthesizes a meeting-shaped recording, runs it through the real pipeline
-(ffmpeg decode -> MLX Whisper -> batched DeepSeek translation -> stored meeting
+(ffmpeg decode -> Qwen3-ASR -> batched DeepSeek translation -> stored meeting
 -> DeepSeek minutes), and then checks the product both structurally and for the
 facts that were actually said.
 
@@ -102,7 +102,12 @@ def main() -> int:
         check(meeting.meta.title == "Q3 复盘会", "the supplied title is kept")
         check(meeting.meta.ended_at is not None, "the record is finalized")
         check(meeting.meta.duration_s > 5, f"audio duration was measured ({meeting.meta.duration_s:.1f}s)")
-        check(len(meeting.segments) >= 4, f"the recording split into segments ({len(meeting.segments)})")
+        check(len(meeting.segments) >= 1, f"the recording kept timestamped spans ({len(meeting.segments)})")
+        check(all(segment.end > segment.start for segment in meeting.segments),
+              "every span has a positive duration")
+        check(all(meeting.segments[index].start >= meeting.segments[index - 1].end - 0.05
+                  for index in range(1, len(meeting.segments))),
+              "spans are ordered and do not overlap")
 
         print("\ntranscript")
         english = " ".join(segment.en for segment in meeting.segments)

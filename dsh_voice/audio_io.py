@@ -2,8 +2,8 @@
 
 Mel-frequency work and resampling are delegated to ffmpeg so that this package
 never needs sox, a system ffmpeg, or a Python sound card binding. Every decode
-returns mono float32 at :data:`config.SAMPLE_RATE`, which is exactly what MLX
-Whisper accepts as its ``audio`` argument.
+returns mono float32 at :data:`config.SAMPLE_RATE`, which is exactly what
+Qwen3-ASR accepts as its ``audio`` argument.
 """
 
 from __future__ import annotations

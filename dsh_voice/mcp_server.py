@@ -30,7 +30,7 @@ LOGGER = logging.getLogger("dsh_voice.mcp")
 mcp: FastMCP = FastMCP(
     name="dsh-voice",
     instructions=(
-        "Local speech tools: transcribe audio files with MLX Whisper, translate English "
+        "Local speech tools: transcribe audio files with Qwen3-ASR, translate English "
         "into Chinese, record from the microphone, keep meeting records, and produce "
         "Chinese meeting minutes. Transcription runs fully offline on the local machine; "
         "only translation and summarization call the DeepSeek API."
@@ -105,7 +105,7 @@ def transcribe_audio(
     translate: bool = False,
     initial_prompt: str | None = None,
 ) -> dict[str, Any]:
-    """Transcribe an audio or video file with the local Whisper model.
+    """Transcribe an audio or video file with the local Qwen3-ASR model.
 
     Args:
         path: Absolute or ~-relative path to any ffmpeg-readable file

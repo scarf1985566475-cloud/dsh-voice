@@ -13,7 +13,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-#: Whisper's fixed input rate. Every buffer in this package is mono float32 at this rate.
+#: ASR's fixed input rate. Every buffer in this package is mono float32 at this rate.
 SAMPLE_RATE = 16_000
 
 #: Package directory (``.../dsh-voice/dsh_voice``).
@@ -23,10 +23,10 @@ PACKAGE_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = PACKAGE_DIR.parent
 
 #: Hugging Face repo the local model directory is populated from (first run only).
-DEFAULT_MODEL_REPO = "mlx-community/whisper-large-v3-turbo"
+DEFAULT_MODEL_REPO = "mlx-community/Qwen3-ASR-0.6B-4bit"
 
 #: Local model directory. Loading from a path keeps every later run fully offline.
-DEFAULT_MODEL_DIR = PROJECT_DIR / "models" / "whisper-large-v3-turbo"
+DEFAULT_MODEL_DIR = PROJECT_DIR / "models" / "qwen3-asr-0.6b-4bit"
 
 
 @dataclass(frozen=True)
@@ -37,22 +37,28 @@ class ModelChoice:
         tag: Short name accepted by ``DSH_VOICE_MODEL``.
         directory: Local directory the weights live in.
         repo: Hugging Face repo to fetch them from on first use.
-        english_only: Whether the model understands only English. An
-            English-only model may be preferred for English audio but must never
-            be chosen for another language or for auto-detection.
         note: One-line description for humans and status payloads.
     """
 
     tag: str
     directory: Path
     repo: str
-    english_only: bool
     note: str
 
     @property
     def present(self) -> bool:
-        """Whether the weights are already on disk."""
-        return (self.directory / "weights.safetensors").exists() or (self.directory / "weights.npz").exists()
+        """Whether the weights are already on disk.
+
+        Qwen3-ASR ships ``model.safetensors`` while the older MLX Whisper
+        snapshots used ``weights.safetensors``/``weights.npz``; accepting any
+        snapshot of that shape keeps this check true for both.
+        """
+        if not self.directory.is_dir():
+            return False
+        for pattern in ("*.safetensors", "*.npz"):
+            if any(self.directory.glob(pattern)):
+                return True
+        return False
 
     def as_public_dict(self) -> dict[str, object]:
         """Serialize for a status payload."""
@@ -60,7 +66,6 @@ class ModelChoice:
             "tag": self.tag,
             "path": str(self.directory),
             "repo": self.repo,
-            "english_only": self.english_only,
             "present": self.present,
             "note": self.note,
         }
@@ -71,25 +76,10 @@ class ModelChoice:
 #: measurements behind it.
 MODEL_CATALOG: tuple[ModelChoice, ...] = (
     ModelChoice(
-        tag="distil",
-        directory=PROJECT_DIR / "models" / "distil-whisper-large-v3",
-        repo="mlx-community/distil-whisper-large-v3",
-        english_only=True,
-        note="English-only distilled large-v3: fastest per point of accuracy on English",
-    ),
-    ModelChoice(
-        tag="turbo",
+        tag="qwen3",
         directory=DEFAULT_MODEL_DIR,
         repo=DEFAULT_MODEL_REPO,
-        english_only=False,
-        note="Multilingual large-v3-turbo: the safe default for any language",
-    ),
-    ModelChoice(
-        tag="small",
-        directory=PROJECT_DIR / "models" / "whisper-small-mlx",
-        repo="mlx-community/whisper-small-mlx",
-        english_only=False,
-        note="Small multilingual: lowest memory and latency, clearly less accurate",
+        note="Qwen3-ASR 0.6B (4-bit): 30 languages, 22 Chinese dialects, auto-detect",
     ),
 )
 
@@ -107,16 +97,14 @@ def select_model(language: str | None, override: str | None = None) -> ModelChoi
     """Pick the model to run for one configuration.
 
     Resolution is deliberately predictable rather than clever: an explicit
-    ``DSH_VOICE_MODEL`` wins, and otherwise the multilingual default is used for
-    every language. An earlier version auto-preferred an English-only model for
-    English audio; measurement showed that model is only ~20% faster at the cost
-    of a small accuracy loss, which is not a clear enough win to switch a
-    default out from under someone.
+    ``DSH_VOICE_MODEL`` wins, and otherwise the single multilingual default is
+    used for every language. Qwen3-ASR detects the language per chunk, so no
+    routing decision is needed here.
 
     Args:
         language: Source language code, or ``None`` for auto-detection. Unused
-            for selection today; kept in the signature because the guard in
-            :func:`model_language_warning` and future routing both need it.
+            for selection today; kept in the signature for compatibility with
+            callers that pass it.
         override: Explicit model tag, path, or repo id.
 
     Returns:
@@ -133,10 +121,9 @@ def select_model(language: str | None, override: str | None = None) -> ModelChoi
             tag=override,
             directory=Path(override).expanduser(),
             repo=override,
-            english_only=False,
             note="explicitly configured",
         )
-    default = find_model("turbo")
+    default = find_model("qwen3")
     assert default is not None  # the catalog always carries the fallback
     return default
 
@@ -144,10 +131,10 @@ def select_model(language: str | None, override: str | None = None) -> ModelChoi
 def model_language_warning(model: str | Path, language: str | None) -> str | None:
     """Report a model that cannot handle the configured language.
 
-    An English-only recognizer handed Chinese audio does not fail loudly; it
-    emits confident nonsense, which then flows into the transcript and the
-    minutes. Saying so up front is the difference between a confusing result and
-    a fixable configuration.
+    Every model in the catalog today is multilingual (Qwen3-ASR covers 30
+    languages and 22 Chinese dialects), so there is no bad pairing to report.
+    The function stays on the status payload because a model loaded from an
+    arbitrary path could still be language-limited; today it returns ``None``.
 
     Args:
         model: Configured model directory.
@@ -156,16 +143,8 @@ def model_language_warning(model: str | Path, language: str | None) -> str | Non
     Returns:
         A warning sentence, or ``None`` when the pairing is fine.
     """
-    choice = next((item for item in MODEL_CATALOG if item.directory == Path(model).expanduser()), None)
-    if choice is None or not choice.english_only:
-        return None
-    if language == "en":
-        return None
-    shown = language or "auto-detect"
-    return (
-        f"model {choice.tag!r} understands English only, but the source language is {shown}; "
-        f"set DSH_VOICE_MODEL=turbo (multilingual) or DSH_VOICE_LANGUAGE=en"
-    )
+    del model, language
+    return None
 
 
 def catalog_as_public_dict() -> list[dict[str, object]]:
@@ -341,14 +320,16 @@ def _env_language() -> str | None:
     """Resolve the source language, where blank and ``auto`` both mean auto-detect.
 
     Plain :func:`_env` cannot express this: it treats a blank value as unset and
-    substitutes the default, which would silently pin an unset language to
-    English.
+    substitutes the default. It also cannot express "default is auto-detect":
+    Qwen3-ASR reports the language per chunk, which is what a bilingual lecture
+    needs, so an unset ``DSH_VOICE_LANGUAGE`` means auto rather than English.
+    Set ``DSH_VOICE_LANGUAGE=en`` to pin English again.
     """
     raw = os.environ.get(_ENV_PREFIX + "LANGUAGE")
     if raw is None:
         raw = os.environ.get("LANGUAGE")
     if raw is None:
-        return "en"
+        return None
     cleaned = raw.strip()
     return None if cleaned.lower() in {"", "auto", "none", "detect"} else cleaned
 
@@ -374,13 +355,22 @@ def load_settings(**overrides: object) -> InterpreterSettings:
         "port": _env_int("PORT", DEFAULT_PORT),
         "translate": _env_bool("TRANSLATE", True),
         "translate_partials": _env_bool("TRANSLATE_PARTIALS", True),
-        "partial_interval_s": _env_float("PARTIAL_INTERVAL", 1.2),
-        "partial_translate_interval_s": _env_float("PARTIAL_TRANSLATE_INTERVAL", 1.8),
+        # Cadence and segment caps are tuned for a busy machine: the decode
+        # worker is shared, so a 1.2 s cadence over an uncapped window queues
+        # faster than a laptop decodes, which is what makes live captions arrive
+        # late. A slower cadence with a short commit window keeps the queue
+        # draining while the text still moves.
+        "partial_interval_s": _env_float("PARTIAL_INTERVAL", 2.0),
+        "partial_translate_interval_s": _env_float("PARTIAL_TRANSLATE_INTERVAL", 2.5),
+        # 700 ms 追踪静音尾比 500 ms 少切半句：少掉半截话、少触发幻觉补全，
+        # 代价是整句延迟约 +0.2 s（用户选定，2026-10-28）。
         "end_silence_ms": _env_int("END_SILENCE_MS", 700),
         "start_speech_ms": _env_int("START_SPEECH_MS", 140),
-        "max_segment_s": _env_float("MAX_SEGMENT", 24.0),
+        "max_segment_s": _env_float("MAX_SEGMENT", 20.0),
         "min_segment_s": _env_float("MIN_SEGMENT", 0.45),
-        "record": _env_bool("RECORD", True),
+        # 默认不把实时会话写入会议记录：纪要改由整场录音离线转写产出，
+        # 实时记录只会留下同一场会的低质量副本。需要时设 DSH_VOICE_RECORD=1。
+        "record": _env_bool("RECORD", False),
         "meetings_dir": _env("MEETINGS_DIR", str(DEFAULT_MEETINGS_DIR)),
         "api_base": _env("API_BASE", DEEPSEEK_BASE_URL),
         "api_model": _env("API_MODEL", DEEPSEEK_MODEL),
@@ -395,10 +385,8 @@ def load_settings(**overrides: object) -> InterpreterSettings:
     # ``language`` accepts the empty string as "auto-detect".
     if values["language"] == "":
         values["language"] = None
-    # Resolve the model through the catalog so a bare tag ("small") becomes its
+    # Resolve the model through the catalog so a bare tag ("qwen3") becomes its
     # directory, and so model_repo always describes the model actually selected.
-    # An English-only model must never be handed non-English audio; that pairing
-    # is surfaced by ``model_language_warning`` rather than silently accepted.
     choice = select_model(values["language"], str(values["model"]) if values["model"] else None)  # type: ignore[arg-type]
     values["model"] = str(choice.directory)
     values["model_repo"] = values["model_repo"] or choice.repo

@@ -344,7 +344,8 @@ def _cmd_benchmark(args: argparse.Namespace) -> int:
     from .config import PROJECT_DIR
 
     models = [Path(item).expanduser() for item in args.models] if args.models else [
-        path for path in sorted((PROJECT_DIR / "models").iterdir()) if path.is_dir()
+        path for path in sorted((PROJECT_DIR / "models").iterdir())
+        if path.is_dir() and not path.name.startswith("_")
     ]
     if not models:
         print(f"no models found under {PROJECT_DIR / 'models'}", file=sys.stderr)
@@ -390,8 +391,7 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
         "model_present": model_present(),
         "model_warning": settings.as_public_dict()["model_warning"],
         "models_installed": [
-            {"tag": choice.tag, "present": choice.present, "english_only": choice.english_only,
-             "note": choice.note}
+            {"tag": choice.tag, "present": choice.present, "note": choice.note}
             for choice in MODEL_CATALOG
         ],
         "translation_configured": settings.api_key is not None,
@@ -406,7 +406,7 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
 
 
 def _cmd_download_model(_args: argparse.Namespace) -> int:
-    """Fetch the Whisper weights into the project directory."""
+    """Fetch the Qwen3-ASR weights into the project directory."""
     from .asr import ensure_model
 
     path = ensure_model()
@@ -426,7 +426,12 @@ def _cmd_selftest(args: argparse.Namespace) -> int:
 
     import numpy as np
 
-    settings = load_settings()
+    overrides: dict[str, Any] = {}
+    if args.language:
+        overrides["language"] = args.language
+    if args.no_translate:
+        overrides["translate"] = False
+    settings = load_settings(**overrides)
     print(f"dsh-voice {__version__} self-test", flush=True)
     steps: list[dict[str, Any]] = []
 
@@ -538,7 +543,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve = sub.add_parser("serve", help="run the live HTTP/WebSocket service")
     serve.add_argument("--host")
     serve.add_argument("--port", type=int)
-    serve.add_argument("--language", help="source language code (default: en)")
+    serve.add_argument("--language", help="source language code (default: auto-detect)")
     serve.add_argument("--no-translate", action="store_true", help="captions only, no Chinese translation")
     serve.add_argument("--reload", action="store_true",
                        help="restart on Python source changes (development; drops a live session)")
@@ -619,7 +624,7 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark.add_argument("--json", action="store_true", help="print the raw payload")
     benchmark.set_defaults(func=_cmd_benchmark)
 
-    download = sub.add_parser("download-model", help="fetch the Whisper weights")
+    download = sub.add_parser("download-model", help="fetch the Qwen3-ASR weights")
     download.set_defaults(func=_cmd_download_model)
 
     selftest = sub.add_parser("selftest", help="end-to-end check without a microphone")

@@ -2,7 +2,7 @@
 
 An energy detector with an adaptive noise floor is enough here: the goal is not
 speech/silence classification for its own sake but *when to commit a decode*.
-Committing at natural pauses keeps Whisper's context window small (so latency
+Committing at natural pauses keeps Qwen3-ASR's context window small (so latency
 stays low) and stops a decoder from rewriting text a viewer already read.
 
 The segmenter only decides boundaries. It never stores audio; the caller owns

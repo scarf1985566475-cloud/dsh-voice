@@ -267,7 +267,7 @@ class MeetingSummarizer:
     async def _http(self) -> httpx.AsyncClient:
         """Lazily create the shared async client."""
         if self._client is None or self._client.is_closed:
-            self._client = httpx.AsyncClient(timeout=self._timeout)
+            self._client = httpx.AsyncClient(timeout=self._timeout, trust_env=False)
         return self._client
 
     async def aclose(self) -> None:

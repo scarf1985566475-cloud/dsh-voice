@@ -1,10 +1,10 @@
 """Regression checks for the decoding recipe and model selection.
 
-These two settings are where a silent mistake is most expensive. The decode
-options decide whether a recognizer can recover from a repetition loop, and the
-model choice decides whether it can understand the audio at all. Both were
-gotten wrong once; the numbers in the assertions below are the measurements that
-caught it.
+Both are where a silent mistake is most expensive. The decode options decide
+whether a recognizer gets the language right — Qwen3-ASR's language hint is
+prompted, not passed, so a stale code or an English-only model turns Chinese
+side-talk into a fluent English hallucination. The model choice decides whether
+the weights are even there.
 
 No model is loaded and no network is touched — this checks the configuration the
 product will run with, not the models themselves.
@@ -22,7 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from dsh_voice.asr import _decode_options  # noqa: E402
+from dsh_voice.asr import _decode_options, _qwen_language  # noqa: E402
 from dsh_voice.config import (  # noqa: E402
     MODEL_CATALOG,
     catalog_as_public_dict,
@@ -64,66 +64,63 @@ def main() -> int:
     file_options = _decode_options("en", streaming=False, initial_prompt=None)
     live_options = _decode_options("en", streaming=True, initial_prompt=None)
 
-    # Pinning temperature to 0.0 disables the fallback ladder that the
-    # compression-ratio guard triggers, which is what let a repetition loop run:
-    # measured 72.6% WER pinned against 0.9% with the ladder, same audio.
-    ladder = file_options["temperature"]
-    check(isinstance(ladder, tuple) and len(ladder) > 1,
-          f"keeps a temperature fallback ladder ({ladder})")
-    check(ladder[0] == 0.0, "starts the ladder at temperature 0")
-    check(live_options["temperature"] == ladder, "live and file paths use the same ladder")
+    # Qwen3-ASR has no temperature fallback ladder and no cross-window text
+    # feedback; a repetition loop is a training-level failure, not a recipe one.
+    check("temperature" not in file_options, "does not pass a Whisper-only temperature ladder")
+    check("condition_on_previous_text" not in file_options,
+          "does not feed its own output back across windows")
+    check(file_options["language"] == "English", "an English code is prompted as English")
+    check(live_options["language"] == "English", "live and file paths prompt the same language")
 
-    # Cross-window prompting is what starts the runaway loop on hard content:
-    # measured 4.7% WER with it on against 0.9% with it off.
-    check(file_options["condition_on_previous_text"] is False, "file path does not feed back its own output")
-    check(live_options["condition_on_previous_text"] is False, "live path does not feed back its own output")
+    # The chunker is the timestamp granularity of a long meeting. Too long and
+    # a citation points at a ten-minute block; too short and words get cut.
+    check(file_options["chunk_duration"] == 30.0, "splits long audio into 30 s timestamped chunks")
+    check(file_options["min_chunk_duration"] < 1.0, "a short live window is not padded with silence")
+    check(file_options["verbose"] is False, "stays quiet")
 
-    for key, expected in (
-        ("compression_ratio_threshold", 2.4),
-        ("logprob_threshold", -1.0),
-        ("no_speech_threshold", 0.6),
+    check(_decode_options(None, streaming=True, initial_prompt=None)["language"] is None,
+          "auto-detect passes None, not a guessed code")
+    check(_decode_options("en", streaming=True, initial_prompt="Aristotle")["system_prompt"] == "Aristotle",
+          "passes a vocabulary hint through the model's prompt channel")
+    check("initial_prompt" not in file_options, "does not leak Whisper's keyword name")
+
+    print("\nlanguage prompt mapping")
+    for given, expected in (
+        ("en", "English"), ("eng", "English"), ("zh", "Chinese"), ("cmn", "Chinese"),
+        ("zh-cn", "Chinese"), ("yue", "Cantonese"), ("zh-hk", "Cantonese"),
+        ("ja", "Japanese"), ("ko", "Korean"), ("fr", "French"),
     ):
-        check(file_options.get(key) == expected, f"keeps {key} at {expected} so the guard can fire")
-
-    # The ladder is only useful if the guards that trigger it are present; a
-    # future edit disabling one silently re-arms the loop.
-    check(file_options["compression_ratio_threshold"] is not None and
-          file_options["logprob_threshold"] is not None,
-          "the guards that escalate the ladder remain enabled")
-
-    for label, options in (("file", file_options), ("live", live_options)):
-        check("streaming" not in options, f"{label} options do not leak non-Whisper kwargs")
-        check(options.get("verbose") is None, f"{label} options stay quiet")
-
-    check(_decode_options(None, streaming=True, initial_prompt=None).get("language") is None,
-          "auto-detect omits the language argument rather than passing None")
-    check(_decode_options("en", streaming=True, initial_prompt="Aristotle").get("initial_prompt") == "Aristotle",
-          "passes a vocabulary hint through")
+        check(_qwen_language(given) == expected, f"{given!r} -> {expected!r}")
+    check(_qwen_language("English") == "English", "a canonical name passes through")
+    check(_qwen_language(None) is None and _qwen_language("") is None, "None and blank mean auto-detect")
+    check(_qwen_language("klingon") is None, "an unknown language falls back to auto-detect, not a bad prompt")
 
     print("\nmodel catalog")
-    check(len(MODEL_CATALOG) >= 3, f"catalog carries the variants ({len(MODEL_CATALOG)})")
-    check(find_model("turbo") is not None, "looks a model up by tag")
-    check(find_model("TURBO") is not None, "tag lookup is case-insensitive")
+    check(len(MODEL_CATALOG) == 1, f"the retired Whisper variants are gone ({len(MODEL_CATALOG)} entry)")
+    check(find_model("qwen3") is not None, "looks the model up by tag")
+    check(find_model("QWEN3") is not None, "tag lookup is case-insensitive")
     check(find_model("nope") is None, "an unknown tag is not invented")
-    check(find_model("turbo") is not None and not find_model("turbo").english_only,
-          "the default model is multilingual")
-    check(any(choice.english_only for choice in MODEL_CATALOG), "an English-only option is offered")
-    described = catalog_as_public_dict()
-    check(all("tag" in item and "present" in item for item in described), "catalog describes each model")
+    check(find_model("turbo") is None and find_model("small") is None and find_model("distil") is None,
+          "the old whisper tags are gone")
+    choices = catalog_as_public_dict()
+    check(all("tag" in item and "present" in item and "note" in item for item in choices),
+          "catalog describes each model")
+    check(all("english_only" not in item for item in choices), "the English-only notion is retired")
 
     print("\nselection")
-    restore = with_env(DSH_VOICE_MODEL="", DSH_VOICE_LANGUAGE="en")
+    restore = with_env(DSH_VOICE_MODEL="", DSH_VOICE_LANGUAGE="")
     try:
         chosen = load_settings()
-        check(chosen.model.endswith("whisper-large-v3-turbo"),
-              f"the unset default is the multilingual model ({Path(chosen.model).name})")
-        check(chosen.model_repo.endswith("whisper-large-v3-turbo"), "the matching repo is recorded")
+        check(chosen.model.endswith("qwen3-asr-0.6b-4bit"),
+              f"the unset default is Qwen3-ASR ({Path(chosen.model).name})")
+        check(chosen.model_repo.endswith("Qwen3-ASR-0.6B-4bit"), "the matching repo is recorded")
+        check(chosen.language is None, "an unset language means auto-detect")
 
-        os.environ["DSH_VOICE_MODEL"] = "small"
-        small = load_settings()
-        check(small.model.endswith("whisper-small-mlx"),
-              f"a bare tag resolves to its directory ({Path(small.model).name})")
-        check(small.model_repo.endswith("whisper-small-mlx"), "the tag's repo follows the tag")
+        os.environ["DSH_VOICE_MODEL"] = "qwen3"
+        aliased = load_settings()
+        check(aliased.model.endswith("qwen3-asr-0.6b-4bit"),
+              f"a bare tag resolves to its directory ({Path(aliased.model).name})")
+        check(aliased.model_repo.endswith("Qwen3-ASR-0.6B-4bit"), "the tag's repo follows the tag")
 
         os.environ["DSH_VOICE_MODEL"] = "/tmp/some-model"
         custom = load_settings()
@@ -132,23 +129,23 @@ def main() -> int:
 
         os.environ["DSH_VOICE_MODEL"] = ""
         os.environ["DSH_VOICE_LANGUAGE"] = "zh"
-        check(load_settings().model.endswith("whisper-large-v3-turbo"), "Chinese audio gets the multilingual model")
+        check(load_settings().language == "zh", "a language code is preserved for the prompt")
         os.environ["DSH_VOICE_LANGUAGE"] = "auto"
         check(load_settings().language is None, "'auto' means auto-detect")
-        check(load_settings().model.endswith("whisper-large-v3-turbo"),
-              "auto-detect gets the multilingual model, never an English-only one")
-        os.environ["DSH_VOICE_LANGUAGE"] = ""
-        check(load_settings().language is None, "a blank language means auto-detect")
+        os.environ["DSH_VOICE_LANGUAGE"] = "none"
+        check(load_settings().language is None, "'none' means auto-detect")
+        os.environ["DSH_VOICE_LANGUAGE"] = "en"
+        check(load_settings().language == "en", "an explicit English code stays explicit")
     finally:
         restore()
 
     print("\nlanguage guard")
-    distil = find_model("distil")
-    assert distil is not None
-    check(model_language_warning(distil.directory, "en") is None, "English-only model + English audio is fine")
-    warning = model_language_warning(distil.directory, "zh")
-    check(warning is not None and "English only" in warning, "flags an English-only model on Chinese audio")
-    check(model_language_warning(distil.directory, None) is not None, "flags it for auto-detect too")
+    qwen3 = find_model("qwen3")
+    assert qwen3 is not None
+    # Qwen3-ASR is multilingual; the guard exists so a future catalog entry
+    # with one language cannot silently receive another.
+    check(model_language_warning(qwen3.directory, "zh") is None, "multilingual model accepts Chinese")
+    check(model_language_warning(qwen3.directory, None) is None, "multilingual model accepts auto-detect")
     check(model_language_warning("/tmp/unknown", "zh") is None, "says nothing about a model it does not know")
 
     print("")

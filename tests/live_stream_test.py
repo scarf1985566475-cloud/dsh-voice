@@ -68,8 +68,14 @@ def audit(events: list[dict], transcript_text: str) -> list[str]:
             if normalized and committed_text.count(normalized) > 1:
                 problems.append(f"final #{finals[index].get('id')} is published more than once: {text!r}")
 
-    reference_words = reference.replace(".", " ").split()
-    committed_words = committed_text.replace(".", " ").split()
+    def words(text: str) -> list[str]:
+        # Compare words, not punctuation: a recognizer that punctuates correctly
+        # must not fail the prefix check by inserting a comma.
+        cleaned = "".join(char if char.isalnum() or char.isspace() else " " for char in text.lower())
+        return cleaned.split()
+
+    reference_words = words(reference)
+    committed_words = words(committed_text)
     if committed_words and reference_words[:len(committed_words)] != committed_words:
         problems.append(
             "committed text is not a prefix of the reference transcript:\n"

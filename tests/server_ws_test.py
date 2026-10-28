@@ -194,8 +194,17 @@ def main() -> int:
         problems.append(f"{len(errors)} error events: {[event.get('message') for event in errors]}")
 
     print("\nmeeting record over HTTP")
+    base = args.url.replace("ws://", "http://").replace("/live", "")
     meeting_id = (ready[0].get("meeting") or {}).get("id") if ready else None
-    if meeting_id is None:
+    # 实时记录默认关闭（RECORD=false）：此时 ready 事件本就不带会议，
+    # 记录断言按跳过处理，而不是判失败。
+    try:
+        recording_enabled = bool(httpx.get(base + "/health", timeout=5).json()["settings"]["record"])
+    except Exception:  # noqa: BLE001 - 拿不到 health 时按开启处理，保留严格断言
+        recording_enabled = True
+    if meeting_id is None and not recording_enabled:
+        print("  skipped      服务端 RECORD=false，本次会话未写入会议记录")
+    elif meeting_id is None:
         problems.append("the ready event carried no meeting: the session was not recorded")
     else:
         print(f"  id           {meeting_id}")

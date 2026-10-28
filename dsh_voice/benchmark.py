@@ -27,6 +27,7 @@ import logging
 import re
 import statistics
 import subprocess
+import os
 import sys
 import time
 from dataclasses import dataclass, field
@@ -212,7 +213,7 @@ class ModelResult:
     def wer_clean_worst(self) -> float:
         """The worse of the two clean runs.
 
-        Whisper can flip into a repetition loop on a numerically identical
+        A recognizer can flip into a repetition loop on a numerically identical
         input — a 16-bit rounding difference is enough — so the honest clean
         score is the worse of the float and quantized runs, not the better one.
         """
@@ -293,9 +294,10 @@ def measure_one(
 ) -> ModelResult:
     """Measure one model in the calling process.
 
-    Decoding uses the *product's* options (``dsh_voice.asr._decode_options``)
-    rather than a benchmark-local recipe: measuring a configuration the product
-    does not run is how a comparison comes to recommend the wrong model.
+    Decoding goes through the *product's* own entry point
+    (``dsh_voice.asr.transcribe_array``) rather than a benchmark-local recipe:
+    measuring a configuration the product does not run is how a comparison
+    comes to recommend the wrong model.
 
     Args:
         model_path: Local model directory.
@@ -309,34 +311,33 @@ def measure_one(
     Returns:
         The measurements, or a result carrying the failure reason.
     """
-    import mlx_whisper
+    from .asr import transcribe_array
 
-    from .asr import _decode_options
+    # Each model is measured in its own interpreter; point the product's
+    # settings at this directory so ``transcribe_array`` decodes *this* model
+    # instead of whatever the machine's default happens to be.
+    os.environ["DSH_VOICE_MODEL"] = str(model_path)
 
     result = ModelResult(model=str(model_path), label=model_path.name, size_mb=model_size_mb(model_path))
-    options = _decode_options(language, streaming=False, initial_prompt=None)
 
     try:
         started = time.monotonic()
         # Warm up: the first call pays the weight load, which is not decode speed.
-        mlx_whisper.transcribe(np.zeros(SAMPLE_RATE // 2, dtype=np.float32),
-                               path_or_hf_repo=str(model_path), **options)
+        transcribe_array(np.zeros(SAMPLE_RATE // 2, dtype=np.float32), language=language)
         result.load_s = time.monotonic() - started
 
         started = time.monotonic()
-        clean_out = mlx_whisper.transcribe(clean, path_or_hf_repo=str(model_path), **options)
+        clean_out = transcribe_array(clean, language=language)
         clean_wall = time.monotonic() - started
-        result.text_clean = str(clean_out.get("text", "")).strip()
+        result.text_clean = clean_out.text
         result.wer_clean = word_error_rate(reference, result.text_clean)
         result.rtf = clean_wall / (clean.size / SAMPLE_RATE) if clean.size else 0.0
 
-        quantized_out = mlx_whisper.transcribe(
-            quantize_int16(clean), path_or_hf_repo=str(model_path), **options,
-        )
-        result.wer_clean_quantized = word_error_rate(reference, str(quantized_out.get("text", "")).strip())
+        quantized_out = transcribe_array(quantize_int16(clean), language=language)
+        result.wer_clean_quantized = word_error_rate(reference, quantized_out.text)
 
-        noisy_out = mlx_whisper.transcribe(noisy, path_or_hf_repo=str(model_path), **options)
-        result.text_noisy = str(noisy_out.get("text", "")).strip()
+        noisy_out = transcribe_array(noisy, language=language)
+        result.text_noisy = noisy_out.text
         result.wer_noisy = word_error_rate(reference, result.text_noisy)
 
         # Latency per slice length: the live path commits roughly the short
@@ -350,8 +351,7 @@ def measure_one(
             timings: list[float] = []
             for offset in offsets:
                 slice_started = time.monotonic()
-                mlx_whisper.transcribe(clean[offset:offset + window],
-                                       path_or_hf_repo=str(model_path), **options)
+                transcribe_array(clean[offset:offset + window], language=language)
                 timings.append((time.monotonic() - slice_started) * 1000.0)
             per_length[f"{seconds:g}s"] = {
                 "median_ms": round(statistics.median(timings), 1),
@@ -552,7 +552,7 @@ def recommend(payload: dict[str, Any]) -> str:
     usable = [item for item in payload["results"] if item["ok"]]
     if not usable:
         return "no model loaded successfully; nothing to recommend"
-    incumbent = next((item for item in usable if item["label"] == "whisper-large-v3-turbo"), None)
+    incumbent = next((item for item in usable if item["label"] == "qwen3-asr-0.6b-4bit"), None)
     best = min(usable, key=lambda item: item["slice_ms"])
     if incumbent is None:
         return f"{best['label']} is the fastest measured model ({best['slice_ms']:.0f}ms per slice)"
@@ -607,7 +607,10 @@ def main(argv: list[str] | None = None) -> int:
 
     models = [Path(item).expanduser() for item in (args.models or [])]
     if not models:
-        models = sorted(path for path in (PROJECT_DIR / "models").iterdir() if path.is_dir())
+        models = sorted(
+            path for path in (PROJECT_DIR / "models").iterdir()
+            if path.is_dir() and not path.name.startswith("_")
+        )
     if args.text_file:
         args.text = Path(args.text_file).expanduser().read_text(encoding="utf-8").strip()
         # An explicit script is its own reference: there is no separate truth.
